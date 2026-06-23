@@ -1,0 +1,22 @@
+# 加密保险库本体与备份 —— 绝不提交（含私密内容，即使已加密也不公开）
+vault.enc
+vault.enc.*
+*.enc
+*.v1bak
+
+# 明文工作目录 —— 绝不提交
+source/
+decrypted/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 系统/编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
