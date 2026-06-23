@@ -8,6 +8,12 @@ vault.enc.*
 source/
 decrypted/
 
+# 操作日志
+vault.log
+
+# 修改密码时的临时备份
+*.pwbak
+
 # Python
 __pycache__/
 *.py[cod]
