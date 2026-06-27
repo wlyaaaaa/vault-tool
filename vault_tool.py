@@ -1601,52 +1601,158 @@ def vault_info():
     _log("INFO: 查看库信息")
 
 
+# ───────────────────────── 加密 / 添加文件（引导式） ─────────────────────────
+
+def add_files_mode(keyfile_path=None):
+    """引导式加密：把文件/文件夹加入保险库。
+
+    设计要点（避免老菜单的两个坑）：
+      - 始终可用：不再要求你先手动建 source/、再隐藏入口。
+      - 不丢数据：已有库时，先解密合并旧内容，再叠加新文件——而不是直接覆盖。
+    """
+    _check_platform()
+    _init_colors()
+    _banner("🔐 加密 / 添加文件")
+    SOURCE_DIR.mkdir(exist_ok=True)
+
+    merged = False
+    # 已有库：先（可选）解密合并，杜绝"加一个文件却把整库覆盖没了"
+    if VAULT_FILE.exists():
+        _warn("已存在保险库。要在不丢失旧内容的前提下加文件，需要先解密合并。")
+        ans = input(
+            "解密并合并旧库内容？[Y/n]（选 n 将用新文件覆盖整库，旧内容会丢失）: "
+        ).strip().lower()
+        if ans in ("", "y", "yes"):
+            with open(VAULT_FILE, "rb") as fh:
+                blob = fh.read()
+            kf = _prompt_keyfile_for_decrypt(blob, keyfile_path)
+            _pw, plaintext, _layer = _get_password_with_retry(
+                "请输入现有库密码：", blob, kf)
+            del _pw
+            try:
+                with tarfile.open(fileobj=io.BytesIO(bytes(plaintext)), mode="r") as tar:
+                    _safe_extractall(tar, SOURCE_DIR)
+                merged = True
+                _ok("旧库内容已展开到 source/（新文件会叠加其上，同名则覆盖）。")
+            finally:
+                _secure_zero(plaintext)
+                del plaintext
+                gc.collect()
+
+    # 展示当前 source/ 内容
+    cur = _collect_source_files()
+    if cur:
+        print(f"\n当前 source/ 已有 {len(cur)} 个文件：")
+        for f in cur[:30]:
+            print("   • " + f.relative_to(SOURCE_DIR).as_posix())
+        if len(cur) > 30:
+            print(f"   … 以及另外 {len(cur) - 30} 个")
+    elif not merged:
+        # 空目录：顺手打开它，邀请用户拖文件进去
+        try:
+            if _IS_WINDOWS:
+                os.startfile(SOURCE_DIR)
+        except Exception:
+            pass
+
+    # 追加新文件：粘贴路径，或直接已放进 source/
+    print(_c("\n把要加密的文件/文件夹放进 source/，或在下面粘贴它们的完整路径：", _GREY))
+    while True:
+        line = input("路径（一行一个，回车结束）: ").strip().strip('"').strip("'")
+        if not line:
+            break
+        src = Path(line).expanduser()
+        if not src.exists():
+            _err(f"路径不存在：{src}")
+            continue
+        try:
+            dest = SOURCE_DIR / src.name
+            if src.is_dir():
+                shutil.copytree(src, dest, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, dest)
+            _ok(f"已加入：{src.name}")
+        except Exception as e:
+            _err(f"复制失败：{e}")
+
+    if not _collect_source_files():
+        _warn("source/ 里没有任何文件，已取消。")
+        return
+
+    if merged:
+        _info("接下来设置（新）库密码——可沿用原密码。")
+    # 交给 encrypt_mode：列文件 → 密钥文件 → 密码 → 压缩打包 → 自检 → 写入 → 安全删 source/
+    encrypt_mode(overwrite=True, keyfile_path=keyfile_path)
+
+
 # ───────────────────────── 交互菜单 ─────────────────────────
 
 def _menu():
     _init_colors()
     ver = vault_version(VAULT_FILE)
     flags = vault_flags(VAULT_FILE)
-    has_source = bool(_collect_source_files())
     has_vault = VAULT_FILE.exists()
 
     print()
-    ver_names = {
-        3: "VAULT03 (scrypt+GCM, 支持密钥文件/诱饵)",
-        2: "VAULT02 (scrypt + AES-256-GCM)",
-        1: "VAULT01 (旧版，建议升级)",
-        0: "未知",
-    }
-    status = ver_names.get(ver, "未知") if has_vault else "（无 vault.enc）"
-    statusc = _GREEN if ver in (2, 3) else (_YELLOW if ver == 1 else _GREY)
     _banner()
-    print("  " + _c("格式：", _GREY) + _c(status, statusc))
-    if ver == 3 and flags and (flags & FLAG_KEYFILE):
-        print("  " + _c("🔑 已启用密钥文件（双因子）", _MAGENTA))
+    if has_vault:
+        ver_names = {
+            3: "VAULT03 (scrypt+GCM, 支持密钥文件/诱饵)",
+            2: "VAULT02 (scrypt + AES-256-GCM)",
+            1: "VAULT01 (旧版，建议升级)",
+            0: "未知",
+        }
+        status = ver_names.get(ver, "未知")
+        statusc = _GREEN if ver in (2, 3) else (_YELLOW if ver == 1 else _GREY)
+        print("  " + _c("当前保险库：", _GREY) + _c(status, statusc))
+        if ver == 3 and flags and (flags & FLAG_KEYFILE):
+            print("  " + _c("🔑 已启用密钥文件（双因子）", _MAGENTA))
+    else:
+        print("  " + _c("当前没有保险库——选「加密 / 添加文件」来创建第一个。", _GREY))
     _rule("━", _CYAN)
 
-    options = []
-    if has_vault:
-        options.append(("1", "解密查看", lambda: decrypt_mode()))
-    if has_source:
-        options.append(("2", "用 source/ 里的文件加密（覆盖现有库）",
-                        lambda: encrypt_mode(overwrite=False)))
-    if ver in (1, 2):
-        options.append(("3", "升级到 VAULT03（明文不落盘）", lambda: migrate_mode()))
-    if has_vault:
-        options.append(("4", "修改密码 / 密钥文件", lambda: change_password_mode()))
-    options.append(("5", "查看库信息（不需要密码）", vault_info))
-    if has_vault:
-        options.append(("6", "设置诱饵密码（抗胁迫 / 似真否认）", lambda: setup_decoy_mode()))
-        options.append(("7", "隐写：把 vault.enc 藏进图片", hide_mode_interactive))
-    options.append(("8", "隐写：从图片提取 vault.enc", unhide_mode_interactive))
-    options.append(("0", "退出", None))
+    # 按分组收集动作；编号在最后统一连续分配，杜绝空号
+    groups = []  # (组名, [(label, fn), ...])
 
+    common = []
+    if has_vault:
+        common.append(("🔓 解密查看 / 搜索内容", lambda: decrypt_mode()))
+    common.append((
+        "🔐 加密 / 添加文件" + ("" if has_vault else "（创建保险库）"),
+        lambda: add_files_mode(),
+    ))
+    groups.append(("常用", common))
+
+    manage = []
+    if ver in (1, 2):
+        manage.append(("⬆️  升级到 VAULT03（明文不落盘）", lambda: migrate_mode()))
+    if has_vault:
+        manage.append(("🔑 修改密码 / 密钥文件", lambda: change_password_mode()))
+        manage.append(("📋 查看库信息（不需要密码）", vault_info))
+    if manage:
+        groups.append(("管理", manage))
+
+    advanced = []
+    if has_vault:
+        advanced.append(("🎭 设置诱饵密码（抗胁迫 / 似真否认）", lambda: setup_decoy_mode()))
+        advanced.append(("🖼️  隐写：把 vault.enc 藏进图片", hide_mode_interactive))
+    advanced.append(("🖼️  隐写：从图片提取 vault.enc", unhide_mode_interactive))
+    if advanced:
+        groups.append(("进阶", advanced))
+
+    # 连续编号渲染
+    numbered = {}
+    n = 0
     print()
-    for k, label, _fn in options:
-        print("  " + _c(f"[{k}]", _BOLD, _CYAN) + f" {label}")
-    if not has_source and has_vault:
-        print(_c("  （把文件放进 source/ 后重跑，可重新加密/加入更多文件）", _GREY))
+    for gname, items in groups:
+        if not items:
+            continue
+        print("  " + _c(gname, _BOLD, _BLUE))
+        for label, fn in items:
+            n += 1
+            numbered[str(n)] = fn
+            print("    " + _c(f"[{n}]", _BOLD, _CYAN) + f" {label}")
+    print("    " + _c("[0]", _BOLD, _CYAN) + " 退出")
 
     # 旧版备份提醒
     for suffix in (".enc.bak", ".enc.v1bak"):
@@ -1656,12 +1762,13 @@ def _menu():
                      "确认新库可解密后建议删除。", _GREY))
 
     choice = input("\n请选择: ").strip()
-    for k, _label, fn in options:
-        if k == choice:
-            if fn:
-                fn()
-            return
-    _err("无效选择。")
+    if choice == "0":
+        return
+    fn = numbered.get(choice)
+    if fn:
+        fn()
+    else:
+        _err("无效选择。")
 
 
 # ───────────────────────── CLI 参数 ─────────────────────────
@@ -1755,12 +1862,6 @@ if __name__ == "__main__":
             except Exception as e:
                 _err(f"提取失败：{e}")
     else:
-        # 交互菜单模式（向下兼容）
-        if VAULT_FILE.exists():
-            _menu()
-        elif _collect_source_files():
-            encrypt_mode()
-        else:
-            _err("未找到 vault.enc，且 source/ 下没有文件。")
-            print(f"   请把要加密的文件放入 {SOURCE_DIR} 后重新运行。")
+        # 交互菜单：始终可用，会根据当前状态（有/无库）自适应
+        _menu()
     print()
