@@ -342,5 +342,195 @@ class TestEndToEndEncryptDecrypt(unittest.TestCase):
             self.assertEqual(tar.extractfile("dir/data.json").read(), b'{"key": "value"}')
 
 
+class TestVault03Roundtrip(unittest.TestCase):
+    """VAULT03 单层容器加密/解密往返。"""
+
+    def test_roundtrip(self):
+        data = b"vault03 payload \x00\x01\x02" * 50
+        blob = vault_tool._pack_vault_v3("pw-strong", data)
+        self.assertTrue(blob.startswith(b"VAULT03"))
+        pt, layer = vault_tool._unpack_vault_v3("pw-strong", blob)
+        self.assertEqual(bytes(pt), data)
+        self.assertEqual(layer, 0)
+        self.assertIsInstance(pt, bytearray)
+
+    def test_wrong_password(self):
+        blob = vault_tool._pack_vault_v3("right", b"secret")
+        with self.assertRaises(ValueError):
+            vault_tool._unpack_vault_v3("wrong", blob)
+
+    def test_slot0_tamper_detected(self):
+        blob = vault_tool._pack_vault_v3("pw", b"data to protect here")
+        tampered = bytearray(blob)
+        tampered[30] ^= 0xFF  # 落在 slot0 区域
+        with self.assertRaises(ValueError):
+            vault_tool._unpack_vault_v3("pw", bytes(tampered))
+
+    def test_dispatcher_handles_v2_and_v3(self):
+        v2 = vault_tool._pack_vault("pw", b"v2 data")
+        pt, layer = vault_tool._decrypt_blob("pw", v2)
+        self.assertEqual(bytes(pt), b"v2 data")
+        self.assertEqual(layer, 0)
+        v3 = vault_tool._pack_vault_v3("pw", b"v3 data")
+        pt, layer = vault_tool._decrypt_blob("pw", v3)
+        self.assertEqual(bytes(pt), b"v3 data")
+
+
+class TestKeyfile(unittest.TestCase):
+    """密钥文件（双因子）。"""
+
+    def setUp(self):
+        self.kf = vault_tool.hashlib.sha256(b"keyfile-bytes").digest()
+
+    def test_flag_set(self):
+        blob = vault_tool._pack_vault_v3("pw", b"x", keyfile_hash=self.kf)
+        self.assertTrue(blob[7] & vault_tool.FLAG_KEYFILE)
+
+    def test_requires_keyfile(self):
+        blob = vault_tool._pack_vault_v3("pw", b"secret", keyfile_hash=self.kf)
+        with self.assertRaises(ValueError):
+            vault_tool._unpack_vault_v3("pw", blob)  # 缺密钥文件
+        with self.assertRaises(ValueError):
+            vault_tool._unpack_vault_v3("pw", blob,
+                                        vault_tool.hashlib.sha256(b"wrong").digest())
+        pt, _ = vault_tool._unpack_vault_v3("pw", blob, self.kf)
+        self.assertEqual(bytes(pt), b"secret")
+
+    def test_keyfile_alone_insufficient(self):
+        blob = vault_tool._pack_vault_v3("pw", b"s", keyfile_hash=self.kf)
+        with self.assertRaises(ValueError):
+            vault_tool._unpack_vault_v3("bad-pw", blob, self.kf)
+
+
+class TestDecoy(unittest.TestCase):
+    """诱饵密码 / 似真否认（双层）。"""
+
+    def test_two_layers(self):
+        real, decoy = b"REAL secrets", b"DECOY fluff"
+        blob = vault_tool._pack_vault_v3(
+            "real-pw", real, decoy_password="decoy-pw", decoy_plaintext=decoy)
+        r_pt, r_lyr = vault_tool._unpack_vault_v3("real-pw", blob)
+        d_pt, d_lyr = vault_tool._unpack_vault_v3("decoy-pw", blob)
+        self.assertEqual(bytes(r_pt), real)
+        self.assertEqual(r_lyr, 1)          # 真实层是隐藏层
+        self.assertEqual(bytes(d_pt), decoy)
+        self.assertEqual(d_lyr, 0)          # 诱饵层是主层
+
+    def test_third_password_rejected(self):
+        blob = vault_tool._pack_vault_v3(
+            "real-pw", b"r", decoy_password="decoy-pw", decoy_plaintext=b"d")
+        with self.assertRaises(ValueError):
+            vault_tool._unpack_vault_v3("other-pw", blob)
+
+    def test_flags_dont_leak_decoy_presence(self):
+        """普通库与诱饵库的标志位字节相同，不泄露隐藏层是否存在。"""
+        plain = vault_tool._pack_vault_v3("pw", b"data")
+        decoy = vault_tool._pack_vault_v3(
+            "pw", b"data", decoy_password="d", decoy_plaintext=b"x")
+        self.assertEqual(plain[7], decoy[7])
+
+
+class TestCompression(unittest.TestCase):
+    """tar + gzip 压缩。"""
+
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_gzip_and_roundtrip(self):
+        (self.tmpdir / "big.txt").write_text("A" * 40000)
+        files = sorted(self.tmpdir.rglob("*"))
+        tar_bytes = vault_tool._make_tar(files, self.tmpdir)
+        self.assertEqual(tar_bytes[:2], b"\x1f\x8b")        # gzip 魔数
+        self.assertLess(len(tar_bytes), 40000)              # 确实压缩了
+        with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r") as tar:
+            self.assertEqual(tar.extractfile("big.txt").read(), b"A" * 40000)
+
+
+class TestSteganography(unittest.TestCase):
+    """隐写：append 到图片尾部。"""
+
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_hide_extract_roundtrip(self):
+        cover = self.tmpdir / "c.jpg"
+        cover.write_bytes(b"\xff\xd8\xff" + secrets.token_bytes(500) + b"\xff\xd9")
+        payload = self.tmpdir / "v.enc"
+        payload.write_bytes(secrets.token_bytes(1234))
+        out = self.tmpdir / "stego.jpg"
+        plen, total = vault_tool.hide_in_image(cover, payload, out)
+        stego = out.read_bytes()
+        self.assertEqual(stego[:3], b"\xff\xd8\xff")         # 封面头完好
+        self.assertEqual(stego[-8:], vault_tool.STEG_MAGIC)
+        rec = self.tmpdir / "rec.enc"
+        got = vault_tool.extract_from_image(out, rec)
+        self.assertEqual(got, 1234)
+        self.assertEqual(rec.read_bytes(), payload.read_bytes())
+
+    def test_plain_image_has_no_payload(self):
+        cover = self.tmpdir / "plain.jpg"
+        cover.write_bytes(b"\xff\xd8\xff\xd9")
+        with self.assertRaises(ValueError):
+            vault_tool.extract_from_image(cover, self.tmpdir / "x")
+
+
+class TestVaultVersionV3(unittest.TestCase):
+    """V3 版本与标志位检测。"""
+
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp())
+        self.f = self.tmpdir / "t.enc"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_version_v3(self):
+        self.f.write_bytes(vault_tool._pack_vault_v3("pw", b"x"))
+        self.assertEqual(vault_tool.vault_version(self.f), 3)
+
+    def test_flags_keyfile(self):
+        kf = vault_tool.hashlib.sha256(b"k").digest()
+        self.f.write_bytes(vault_tool._pack_vault_v3("pw", b"x", keyfile_hash=kf))
+        self.assertTrue(vault_tool.vault_flags(self.f) & vault_tool.FLAG_KEYFILE)
+
+    def test_flags_none_for_v2(self):
+        self.f.write_bytes(vault_tool._pack_vault("pw", b"x"))
+        self.assertIsNone(vault_tool.vault_flags(self.f))
+
+
+class TestSecureZero(unittest.TestCase):
+    """memset 快速清零。"""
+
+    def test_zeroes_bytearray(self):
+        ba = bytearray(b"sensitive" * 100)
+        vault_tool._secure_zero(ba)
+        self.assertEqual(ba, bytearray(len(b"sensitive" * 100)))
+
+    def test_empty_and_none_safe(self):
+        vault_tool._secure_zero(bytearray())
+        vault_tool._secure_zero(None)  # 不应报错
+
+
+class TestPasswordEntropy(unittest.TestCase):
+    """密码强度评估。"""
+
+    def test_empty_is_zero(self):
+        self.assertEqual(vault_tool._password_entropy_bits(""), 0.0)
+
+    def test_longer_is_stronger(self):
+        weak = vault_tool._password_entropy_bits("abc123")
+        strong = vault_tool._password_entropy_bits("correct-horse-battery-staple-river")
+        self.assertGreater(strong, weak)
+
+    def test_strength_bar_runs(self):
+        self.assertIn("bits", vault_tool._strength_bar("some-password"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

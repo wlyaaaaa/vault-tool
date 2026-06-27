@@ -1,11 +1,16 @@
-# Vault v1.1.0 — 本地加密保险库
+# Vault v2.0.0 — 本地加密保险库
 
 纯 Python 离线加密工具。Windows 下**零第三方依赖**（仅标准库 + 内置 `bcrypt.dll`）；Linux / macOS 需 `pip install cryptography`。
 
 - 密钥派生：**scrypt**（内存硬，抗 GPU/ASIC 暴力破解）
 - 对称加密：**AES-256-GCM**（带认证标签，可检测篡改）
+- 压缩：**tar + gzip**（节省空间，并消除明文统计特征）
+- 双因子：可选**密钥文件**混入密钥派生（密码 + 文件）
+- 抗胁迫：可选**诱饵密码**——双层容器，无法证明隐藏层是否存在
+- 取证对抗：明文**内存锁页**（防换页到 pagefile）、**紧急销毁热键**
+- 隐藏存在：**隐写术**——把 `vault.enc` 藏进一张正常图片
 - 抗量子：AES-256 对量子 Grover 算法仍有等效 128 位强度，足够安全
-- 支持任意文件类型、含子目录；仍兼容解密旧版 `VAULT01`
+- 支持任意文件类型、含子目录；仍兼容解密旧版 `VAULT02` / `VAULT01`
 
 ---
 
@@ -16,7 +21,7 @@
 - 量子计算机：威胁的是 RSA/椭圆曲线等**非对称**加密；本工具用对称 AES，**不受影响**。
 - 国家级超算：瓶颈是你密码的「熵」。10 位随机字符 ≈ 2⁶⁶，配合 scrypt 已极难，但**不是绝对无解**；若是"有意义"的密码（单词/生日/键盘连排），实际只有 30~40 位熵，很快被破。
 
-**强烈建议**：用更长的口令——6 个以上随机单词（如 `correct-horse-battery-staple-river-stone`），或 16 位以上随机串。**长度比复杂度更管用。**
+**强烈建议**：用更长的口令——6 个以上随机单词（如 `correct-horse-battery-staple-river-stone`），或 16 位以上随机串。**长度比复杂度更管用。** 工具会在你输入时显示一条强度条作为参考。
 
 ---
 
@@ -24,11 +29,12 @@
 
 ```
 项目目录/
-├── vault_tool.py     # 唯一脚本，加密/解密/升级入口
+├── vault_tool.py     # 唯一脚本，加密/解密/升级/诱饵/隐写入口
 ├── vault.enc         # 加密后的保险库文件
-├── vault.enc.v1bak   # 升级时自动生成的旧库备份（确认后可删）
+├── vault.enc.bak     # 升级/改密时自动生成的旧库备份（确认后可删）
 ├── vault.log         # 操作日志（仅记录时间戳，不含密码或内容）
 ├── source/           # 【加密时手动创建】放入要加密的任意文件
+├── decoy_source/     # 【设诱饵时手动创建】放入"看起来合理的假文件"
 └── decrypted/        # 解密临时输出，阅后自动安全删除
 ```
 
@@ -40,12 +46,16 @@
 
 运行：`python vault_tool.py`
 
-- **存在 `vault.enc`** → 进入菜单：
-  - `[1]` 解密查看，解密成功后可选两种查看方式（见下）
-  - `[2]` 用 `source/` 里的文件重新加密（覆盖；**这是"加入更多文件"的方式**）
-  - `[3]` 一键升级到最新加密（仅旧版 VAULT01 出现，明文不落盘，自动备份+自检）
-  - `[4]` 修改密码
-  - `[5]` 查看库信息（不需要密码）
+| 选项 | 功能 |
+|------|------|
+| `[1]` | 解密查看（成功后可选不落盘查看 / 解压到文件夹） |
+| `[2]` | 用 `source/` 里的文件加密（覆盖；这是"加入更多文件"的方式） |
+| `[3]` | 升级旧版到 VAULT03（仅旧库出现，明文不落盘，自动备份+自检） |
+| `[4]` | 修改密码 / 更换或移除密钥文件 |
+| `[5]` | 查看库信息（不需要密码） |
+| `[6]` | 设置诱饵密码（抗胁迫 / 似真否认） |
+| `[7]` | 隐写：把 `vault.enc` 藏进图片 |
+| `[8]` | 隐写：从图片提取 `vault.enc` |
 
 ### 两种查看方式（控制明文是否可恢复）
 
@@ -54,25 +64,95 @@
 | `[1]` 不落盘安全查看（默认） | **否，只在内存** | **不可恢复** ✅ | 看密码/文本笔记 |
 | `[2]` 解压到 `decrypted/` | 是 | 正常退出/Ctrl+C 自动清除；**强杀可能残留** ⚠️ | 需用外部程序打开图片/PDF 等 |
 
-- 不落盘模式下，二进制/超大文件无法在终端显示，需要时改用 `[2]`。
+- **选择性查看 + 搜索**：不落盘模式下可输入关键字搜索文件名，`/前缀` 按内容搜索，回车看全部，`:q` 结束——无需把 200 个文件全打印出来。
+- **紧急销毁热键**：在"按 Enter 退出"的等待界面按 **Ctrl+X**，立即清零内存、删除 `decrypted/`、清屏并硬退出（< 1 秒）。
 - 程序**启动时**若发现上次崩溃残留的 `decrypted/`，会自动安全清除。
-- 残余风险：内存理论上可能被系统换页到 pagefile；如需极致安全，请在内存充足、未休眠的环境下使用不落盘模式。
-- **不存在 `vault.enc` 且 `source/` 有文件** → 直接进入加密
-- 加入更多文件的流程：把新文件放进 `source/` → 运行 → 选 `[2]` 重新加密
+- 明文在内存期间会尽力**锁页**（`VirtualLock`/`mlock`），降低被换页到 pagefile 的风险（详见下方"残余风险"）。
 
 ### CLI 模式
 
-无需交互菜单，直接执行子命令：
+```bash
+python vault_tool.py --version                 # 显示版本号
+python vault_tool.py encrypt                    # 加密 source/ 目录
+python vault_tool.py encrypt --keyfile cat.jpg  # 加密并绑定密钥文件（双因子）
+python vault_tool.py decrypt                     # 解密查看
+python vault_tool.py decrypt --no-disk           # 不落盘安全查看
+python vault_tool.py decrypt --extract           # 解压到 decrypted/
+python vault_tool.py decrypt --keyfile cat.jpg   # 提供密钥文件
+python vault_tool.py info                         # 查看库信息（不需要密码）
+python vault_tool.py passwd                       # 修改密码 / 密钥文件
+python vault_tool.py migrate                      # 升级旧版 → VAULT03
+python vault_tool.py decoy                        # 设置诱饵密码
+python vault_tool.py hide   --cover photo.jpg --out album.jpg   # 藏入图片
+python vault_tool.py unhide --in album.jpg --out vault.enc      # 从图片提取
+python vault_tool.py --no-color ...               # 禁用彩色输出
+```
+
+---
+
+## 🔑 双因子：密钥文件
+
+除密码外，再指定一个任意文件（照片 / PDF / 音乐）作为第二因子。密钥派生变为
+`scrypt(password ‖ SHA-256(keyfile), salt)`。
+
+- 即使密码被社工/胁迫泄露，**没有密钥文件仍然打不开**。
+- 密钥文件可放在 U 盘上，与加密库物理隔离。
+- ⚠️ 密钥文件本身不能改动、不能丢失——它和密码同等重要，丢了就永久无法解密。
+- 加密时回答 `y` 即可绑定；解密时库头会声明需要它并提示你提供。
+
+---
+
+## 🎭 诱饵密码（Plausible Deniability，抗胁迫）
+
+有人逼你交出密码时，你交出**诱饵密码**：它能成功解密，但解出来的是一组看起来
+合理的假文件（几张普通照片、一份无聊备忘录）。对方满意离开，你的真实数据安然无恙。
+
+**怎么用**
+
+1. 把假文件放进 `decoy_source/`。
+2. 菜单 `[6]`（或 `python vault_tool.py decoy`）。
+3. 先输真实密码验证身份，再设一个不同的诱饵密码。
+4. 工具生成双层容器，并双向自检（真密码→真实数据、诱饵密码→假数据）。
+
+**为什么对方无法识破**
+
+`vault.enc` 内部 = `头部 + 主层 + 尾部区域`：
+
+```
+┌────────────────────────────────────────────────┐
+│ VAULT03 头部（标志位不暴露是否存在隐藏层）       │
+│ 主层  ── 诱饵密码解开（被胁迫时交出）            │
+│ 尾部  ── 真实密码解开 ── 或 ── 纯随机填充        │
+│         （二者在密文上不可区分）                 │
+└────────────────────────────────────────────────┘
+```
+
+普通库的尾部是**随机填充**；诱饵库的尾部是**加密的真实层**。AES-GCM 密文与随机数
+不可区分，且尾部长度不在文件里标注——**数学上无法证明第二个密码是否存在**。这与
+VeraCrypt 隐藏卷同理。
+
+> **诚实的边界（请务必理解）**
+> - 可否认性是**操作纪律**，不只是格式。诱饵数据应与真实数据**体量相当**，否则一个
+>   "明显偏小的尾部"会让对手怀疑。
+> - 不要在对手能比对的地方留下旧的单层备份（`vault.enc.bak`）——设好诱饵后请安全删除它。
+> - 若对手能多次取得同一文件的快照、或掌握你的使用习惯，纯密码学不足以保护你。
+>   此功能用于**合法的个人数据保护**，请在你所在司法辖区的法律框架内使用。
+
+---
+
+## 🖼️ 隐写术：把保险库藏进图片
+
+`vault.enc` 这个文件名本身就在喊"我有秘密"。隐写把加密数据追加到一张正常
+JPEG/PNG 的末尾：图片查看器在各自的结束标记处停止解析，看到的仍是一张普通照片；
+用本工具 `unhide` 则提取出加密数据。
 
 ```bash
-python vault_tool.py --version          # 显示版本号
-python vault_tool.py encrypt            # 加密 source/ 目录
-python vault_tool.py decrypt            # 解密到 decrypted/
-python vault_tool.py decrypt --no-disk  # 不落盘安全查看
-python vault_tool.py info               # 查看库信息（不需要密码）
-python vault_tool.py passwd             # 修改密码
-python vault_tool.py migrate            # 升级旧版 VAULT01 → VAULT02
+python vault_tool.py hide   --cover vacation.jpg --out album.jpg
+python vault_tool.py unhide --in album.jpg --out vault.enc
 ```
+
+结构：`封面字节 ‖ 加密数据 ‖ 长度(uint64) ‖ "VLTSTEG1"`。注意这是**隐藏存在**，不是
+额外加密——真正的机密性仍来自 AES-256-GCM 本身。
 
 ---
 
@@ -83,49 +163,70 @@ python vault_tool.py migrate            # 升级旧版 VAULT01 → VAULT02
 | Windows | **零依赖**——标准库 + 系统内置 `bcrypt.dll` |
 | Linux / macOS | 需安装 `pip install cryptography` |
 
----
-
-## 操作日志
-
-`vault.log` 记录每次操作的时间戳（**不含密码或明文内容**），用于审计和排错。该文件已加入 `.gitignore`，不会被提交。
+终端样式（彩色、强度条、进度）使用纯 ANSI 转义码，**零额外依赖**；非 TTY 或设置了
+`NO_COLOR` / `--no-color` 时自动退化为纯文本。
 
 ---
 
-## 加密参数（VAULT02）
+## 加密参数（VAULT03）
 
 | 参数 | 值 |
 |------|-----|
 | 密钥派生 | scrypt（N=2¹⁷, r=8, p=1，约 128 MB 内存/次） |
 | 对称加密 | AES-256-GCM |
-| Salt | 32 字节随机 |
-| Nonce | 12 字节随机 |
-| 认证 | 16 字节 GCM tag，并将文件头作为 AAD 一并认证 |
-| 容器 | tar 打包（保留子目录结构）后整体加密 |
-
----
-
-## 注意事项
-
-- **密码丢失 = 数据永久丢失**，无任何找回机制。
-- `vault.enc` 可安全备份到任何地方（无密码无法解密）。
-- Windows 使用内置 `bcrypt.dll`；Linux/macOS 需 `pip install cryptography`。
-- **SSD 安全删除的局限**：脚本对原文做一遍随机覆写后删除，但 SSD 因磨损均衡/TRIM，覆写**不保证**抹掉原始数据。最可靠的是"明文尽量不落盘、看完即焚"。
+| Salt | 每层 32 字节随机 |
+| Nonce | 每层 12 字节随机 |
+| 认证 | 16 字节 GCM tag，并将头部作为 AAD 一并认证 |
+| 容器 | tar + gzip 压缩后整体加密；双槽布局支持可选隐藏层 |
+| 第二因子 | 可选 SHA-256(密钥文件) 混入密钥材料 |
 
 ---
 
 ## 文件格式（vault.enc 内部结构）
 
-**VAULT02（当前）**
+**VAULT03（当前）**
 ```
-[7 bytes]   魔数 "VAULT02"
-[1 byte]    KDF id (1 = scrypt)
-[12 bytes]  N, r, p（各 big-endian uint32）
-[2 bytes]   salt 长度 (uint16) + salt
-[2 bytes]   nonce 长度 (uint16) + nonce
-[16 bytes]  GCM 认证标签 (tag)
-[8 bytes]   密文长度 (big-endian uint64)
-[M bytes]   AES-256-GCM 密文（内含 tar 包）
+[7]    魔数 "VAULT03"
+[1]    标志位（bit0=需要密钥文件, bit1=已压缩；不记录是否含隐藏层）
+[13]   KDF id + scrypt N, r, p
+── 主层 slot0（定长，可被交出的一层）──
+[2]    salt 长度 + [32] salt
+[2]    nonce 长度 + [12] nonce
+[16]   GCM tag
+[8]    密文长度 (uint64)
+[M]    AES-256-GCM 密文（内含 tar.gz）
+── 尾部 slot1（隐藏层 或 随机填充，长度不标注，直到 EOF）──
+[32]   salt（或随机）
+[12]   nonce（或随机）
+[16]   tag（或随机）
+[…]    密文（或随机填充）—— 到文件末尾
 ```
-注：从魔数到 nonce 的整个头部作为 GCM 的 AAD 一并认证，篡改头部也会被发现。
+解密时先试主层、再试尾部；输入哪个密码就解开对应的那层。
 
-**VAULT01（旧版，仅兼容解密）**：PBKDF2-SHA256(60万次) + AES-256-CBC + PKCS#7。
+**VAULT02（兼容解密）**：scrypt + AES-256-GCM 单层（头部作 AAD）。
+**VAULT01（兼容解密）**：PBKDF2-SHA256(60万次) + AES-256-CBC + PKCS#7。
+
+---
+
+## 残余风险（诚实清单）
+
+- **内存副本**：明文主缓冲区会尽力锁页，但 Python 在解析 tar 时会产生副本，
+  无法保证锁住所有副本。极致安全请在内存充足、未休眠的环境下使用不落盘模式。
+- **SSD 安全删除**：脚本对原文做一遍随机覆写后删除，但 SSD 因磨损均衡/TRIM，
+  覆写**不保证**抹掉原始数据。最可靠的是"明文尽量不落盘、看完即焚"。
+- **强杀进程/断电**：`[2]` 解压模式下若被 `taskkill /F` 或断电，`decrypted/`
+  可能残留明文（程序下次启动会自动清除）。`[1]` 不落盘模式无此风险。
+- **密码丢失 = 数据永久丢失**，无任何找回机制。密钥文件同理。
+- `vault.enc` 可安全备份到任何地方（无密码无法解密）。
+
+---
+
+## 测试
+
+```bash
+python test_vault_tool.py            # 54 个单元测试
+# 或： python -m pytest test_vault_tool.py -v
+```
+
+覆盖：密钥派生、V1/V2/V3 往返、篡改检测、路径遍历防护、密钥文件、诱饵双层、
+压缩、隐写、安全删除、内存清零、密码强度等。

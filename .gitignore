@@ -6,13 +6,19 @@ vault.enc.*
 
 # 明文工作目录 —— 绝不提交
 source/
+decoy_source/
 decrypted/
+
+# 隐写输出（内含加密库，避免误提交）
+hidden.*
+*.recovered.enc
 
 # 操作日志
 vault.log
 
-# 修改密码时的临时备份
+# 修改密码 / 升级时的临时备份
 *.pwbak
+*.bak
 
 # Python
 __pycache__/
