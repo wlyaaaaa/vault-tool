@@ -13,7 +13,9 @@ import tarfile
 import io
 import tempfile
 import shutil
+import contextlib
 import unittest
+from unittest import mock
 from pathlib import Path
 
 # 确保能导入同目录下的 vault_tool
@@ -530,6 +532,226 @@ class TestPasswordEntropy(unittest.TestCase):
 
     def test_strength_bar_runs(self):
         self.assertIn("bits", vault_tool._strength_bar("some-password"))
+
+
+def _fast_kdf(password, salt, n=None, r=None, p=None, keyfile_hash=None):
+    """快速、确定性的 KDF 替身：用于交互流程测试（验证编排/IO，而非 KDF 强度）。
+
+    保持"相同输入→相同密钥"，让 pack/unpack 自洽即可；scrypt 的内存硬度由
+    TestKeyDerivation 单独覆盖。
+    """
+    material = password.encode("utf-8") if isinstance(password, str) else bytes(password)
+    if keyfile_hash:
+        material += keyfile_hash
+    import hashlib as _h
+    return _h.pbkdf2_hmac("sha256", material, salt, 1)[:32]
+
+
+class _FlowBase(unittest.TestCase):
+    """交互流程测试基类：临时目录 + 快速 KDF + 脚本化 getpass/input。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self._orig = {k: getattr(vault_tool, k) for k in (
+            "SOURCE_DIR", "DECOY_SOURCE_DIR", "DECRYPTED_DIR",
+            "VAULT_FILE", "derive_key_scrypt")}
+        vault_tool.SOURCE_DIR = self.tmp / "source"
+        vault_tool.DECOY_SOURCE_DIR = self.tmp / "decoy_source"
+        vault_tool.DECRYPTED_DIR = self.tmp / "decrypted"
+        vault_tool.VAULT_FILE = self.tmp / "vault.enc"
+        vault_tool.derive_key_scrypt = _fast_kdf
+        self._patches = [
+            mock.patch.object(vault_tool, "_clear_terminal", lambda: None),
+            mock.patch.object(vault_tool, "_pause_or_panic", lambda prompt, cb: None),
+        ]
+        for p in self._patches:
+            p.start()
+        self._had_startfile = hasattr(os, "startfile")
+        if self._had_startfile:
+            self._orig_startfile = os.startfile
+            os.startfile = lambda *a, **k: None
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        for k, v in self._orig.items():
+            setattr(vault_tool, k, v)
+        if self._had_startfile:
+            os.startfile = self._orig_startfile
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_with(self, fn, getpass_vals, input_vals):
+        with mock.patch.object(vault_tool, "getpass", side_effect=list(getpass_vals)), \
+             mock.patch("builtins.input", side_effect=list(input_vals)), \
+             contextlib.redirect_stdout(io.StringIO()):
+            fn()
+
+    def names_in_vault(self, pw, keyfile_hash=None):
+        pt, _ = vault_tool._decrypt_blob(pw, vault_tool.VAULT_FILE.read_bytes(), keyfile_hash)
+        with tarfile.open(fileobj=io.BytesIO(bytes(pt)), mode="r") as tar:
+            return set(tar.getnames())
+
+    def make_source(self, **files):
+        vault_tool.SOURCE_DIR.mkdir(parents=True, exist_ok=True)
+        for name, content in files.items():
+            (vault_tool.SOURCE_DIR / name).write_text(content, encoding="utf-8")
+
+
+class TestEncryptDecryptFlow(_FlowBase):
+    def test_encrypt_creates_v3_and_deletes_source(self):
+        self.make_source(**{"a.txt": "alpha", "b.txt": "beta"})
+        self.run_with(lambda: vault_tool.encrypt_mode(overwrite=True),
+                      ["pw", "pw"], ["n"])
+        self.assertTrue(vault_tool.VAULT_FILE.exists())
+        self.assertFalse(vault_tool.SOURCE_DIR.exists())
+        self.assertEqual(vault_tool.vault_version(vault_tool.VAULT_FILE), 3)
+        self.assertEqual(self.names_in_vault("pw"), {"a.txt", "b.txt"})
+
+    def test_decrypt_extract_then_cleans(self):
+        self.make_source(**{"note.txt": "secret"})
+        self.run_with(lambda: vault_tool.encrypt_mode(overwrite=True), ["pw", "pw"], ["n"])
+        self.run_with(lambda: vault_tool.decrypt_mode(force_extract=True), ["pw"], [])
+        # 看完后 decrypted/ 应被安全删除
+        self.assertFalse(vault_tool.DECRYPTED_DIR.exists()
+                         and any(vault_tool.DECRYPTED_DIR.iterdir()))
+
+    def test_encrypt_with_keyfile(self):
+        kf = self.tmp / "key.bin"
+        kf.write_bytes(b"keyfile-material-123")
+        self.make_source(**{"x.txt": "data"})
+        self.run_with(lambda: vault_tool.encrypt_mode(
+            overwrite=True, keyfile_path=str(kf)), ["pw", "pw"], [])
+        flags = vault_tool.vault_flags(vault_tool.VAULT_FILE)
+        self.assertTrue(flags & vault_tool.FLAG_KEYFILE)
+        # 没密钥文件解不开；有则可以
+        with self.assertRaises(ValueError):
+            self.names_in_vault("pw")
+        kfh = vault_tool._keyfile_hash(str(kf))
+        self.assertIn("x.txt", self.names_in_vault("pw", kfh))
+
+
+class TestAddFilesFlow(_FlowBase):
+    def _make_initial(self, pw="pw-A"):
+        self.make_source(**{"old.txt": "OLD"})
+        self.run_with(lambda: vault_tool.encrypt_mode(overwrite=True), [pw, pw], ["n"])
+
+    def test_merge_preserves_old_and_adds_new(self):
+        self._make_initial("pw-A")
+        newf = self.tmp / "new.txt"
+        newf.write_text("NEW", encoding="utf-8")
+        # 合并 Y(回车) → 旧库密码 → 粘贴新路径 → 回车结束 → encrypt keyfile n → 新密码×2
+        self.run_with(lambda: vault_tool.add_files_mode(),
+                      ["pw-A", "pw-A", "pw-A"], ["", str(newf), "", "n"])
+        names = self.names_in_vault("pw-A")
+        self.assertIn("old.txt", names)
+        self.assertIn("new.txt", names)
+
+    def test_no_merge_overwrites(self):
+        self._make_initial("pw-A")
+        solo = self.tmp / "solo.txt"
+        solo.write_text("SOLO", encoding="utf-8")
+        self.run_with(lambda: vault_tool.add_files_mode(),
+                      ["pw-B", "pw-B"], ["n", str(solo), "", "n"])
+        self.assertEqual(self.names_in_vault("pw-B"), {"solo.txt"})
+
+
+class TestChangePasswordFlow(_FlowBase):
+    def test_change_password(self):
+        self.make_source(**{"x.txt": "data"})
+        self.run_with(lambda: vault_tool.encrypt_mode(overwrite=True), ["old", "old"], ["n"])
+        self.run_with(lambda: vault_tool.change_password_mode(),
+                      ["old", "new", "new"], ["n"])
+        self.assertIn("x.txt", self.names_in_vault("new"))
+        with self.assertRaises(ValueError):
+            self.names_in_vault("old")
+
+
+class TestMigrateFlow(_FlowBase):
+    def test_v2_to_v3(self):
+        vault_tool.VAULT_FILE.write_bytes(vault_tool._pack_vault("pw", b"legacy data"))
+        self.assertEqual(vault_tool.vault_version(vault_tool.VAULT_FILE), 2)
+        self.run_with(lambda: vault_tool.migrate_mode(), ["pw"], ["n"])
+        self.assertEqual(vault_tool.vault_version(vault_tool.VAULT_FILE), 3)
+        pt, _ = vault_tool._decrypt_blob("pw", vault_tool.VAULT_FILE.read_bytes())
+        self.assertEqual(bytes(pt), b"legacy data")
+
+
+class TestDecoyFlow(_FlowBase):
+    def test_setup_decoy_two_layers(self):
+        self.make_source(**{"real.txt": "REAL"})
+        self.run_with(lambda: vault_tool.encrypt_mode(overwrite=True),
+                      ["realpw", "realpw"], ["n"])
+        vault_tool.DECOY_SOURCE_DIR.mkdir(parents=True)
+        (vault_tool.DECOY_SOURCE_DIR / "fake.txt").write_text("FAKE", encoding="utf-8")
+        self.run_with(lambda: vault_tool.setup_decoy_mode(),
+                      ["realpw", "decoypw", "decoypw"], [])
+        self.assertIn("real.txt", self.names_in_vault("realpw"))
+        self.assertIn("fake.txt", self.names_in_vault("decoypw"))
+        self.assertFalse(vault_tool.DECOY_SOURCE_DIR.exists())
+
+
+class TestMenuLoop(unittest.TestCase):
+    """持久菜单循环：只有 [0]/EOF 才退出；异常与中断都回菜单。"""
+
+    def test_loops_until_exit(self):
+        calls = []
+
+        def fake_menu():
+            calls.append(1)
+            return "exit" if len(calls) >= 3 else None
+
+        with mock.patch.object(vault_tool, "_menu", side_effect=fake_menu), \
+             mock.patch("builtins.input", return_value=""), \
+             contextlib.redirect_stdout(io.StringIO()):
+            vault_tool._menu_loop()
+        self.assertEqual(len(calls), 3)
+
+    def test_survives_action_exception(self):
+        with mock.patch.object(vault_tool, "_menu",
+                               side_effect=[ValueError("boom"), "exit"]), \
+             mock.patch("builtins.input", return_value=""), \
+             contextlib.redirect_stdout(io.StringIO()):
+            vault_tool._menu_loop()  # 不应抛出
+
+    def test_survives_vault_locked(self):
+        with mock.patch.object(vault_tool, "_menu",
+                               side_effect=[vault_tool.VaultLocked("locked"), "exit"]), \
+             mock.patch("builtins.input", return_value=""), \
+             contextlib.redirect_stdout(io.StringIO()):
+            vault_tool._menu_loop()
+
+    def test_keyboardinterrupt_returns_to_menu(self):
+        with mock.patch.object(vault_tool, "_menu",
+                               side_effect=[KeyboardInterrupt(), "exit"]), \
+             mock.patch("builtins.input", return_value=""), \
+             contextlib.redirect_stdout(io.StringIO()):
+            vault_tool._menu_loop()
+
+    def test_eof_breaks_loop(self):
+        with mock.patch.object(vault_tool, "_menu", side_effect=EOFError()), \
+             contextlib.redirect_stdout(io.StringIO()):
+            vault_tool._menu_loop()  # EOF 应跳出，不死循环
+
+
+class TestMakeTarGzipMtime(unittest.TestCase):
+    """tar.gz 头部 mtime 应固定为 0（去元数据），且仍可往返。"""
+
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_gzip_mtime_zero(self):
+        (self.tmpdir / "a.txt").write_text("hello")
+        files = sorted(self.tmpdir.rglob("*"))
+        data = vault_tool._make_tar(files, self.tmpdir)
+        # gzip 头：魔数(2) + 方法(1) + 标志(1) + mtime(4, 小端)
+        self.assertEqual(data[:2], b"\x1f\x8b")
+        mtime = struct.unpack("<I", data[4:8])[0]
+        self.assertEqual(mtime, 0)
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r") as tar:
+            self.assertEqual(tar.extractfile("a.txt").read(), b"hello")
 
 
 if __name__ == "__main__":

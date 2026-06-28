@@ -27,6 +27,7 @@ import math
 import hashlib
 import secrets
 import tarfile
+import gzip
 import io
 import struct
 import shutil
@@ -95,6 +96,13 @@ TEXT_PRINT_LIMIT = 64 * 1024
 # 密码重试
 MAX_RETRIES = 5
 RETRY_BASE_DELAY = 2  # 秒
+
+
+class VaultLocked(Exception):
+    """连续密码错误达上限——可恢复异常。
+
+    菜单模式下捕获后返回菜单（程序不退出）；CLI 模式下转为退出码 1。
+    """
 
 
 # ───────────────────────── ANSI 终端样式（零依赖） ─────────────────────────
@@ -862,12 +870,17 @@ def _make_tar(files, src_dir=None):
     src_dir = src_dir or SOURCE_DIR
     buf = io.BytesIO()
     total = len(files)
-    # mtime=0：去掉 gzip 头里的时间戳元数据（虽在密文内，但保持洁净）
-    with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=6) as tar:
-        for i, f in enumerate(files, 1):
-            tar.add(f, arcname=f.relative_to(src_dir).as_posix())
-            if total > 10 and i % max(1, total // 10) == 0:
-                print(_c(f"   打包进度：{i}/{total} ({i * 100 // total}%)", _GREY))
+    # 手动包一层 GzipFile 并把 mtime 固定为 0：去掉 gzip 头里的时间戳元数据。
+    # （文件本身的 mtime 仍保留在 tar 成员里，解压后时间不丢失。）
+    gz = gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=6, mtime=0)
+    try:
+        with tarfile.open(fileobj=gz, mode="w") as tar:
+            for i, f in enumerate(files, 1):
+                tar.add(f, arcname=f.relative_to(src_dir).as_posix())
+                if total > 10 and i % max(1, total // 10) == 0:
+                    print(_c(f"   打包进度：{i}/{total} ({i * 100 // total}%)", _GREY))
+    finally:
+        gz.close()
     return buf.getvalue()
 
 
@@ -901,9 +914,9 @@ def _get_password_with_retry(prompt, vault_blob, keyfile_hash=None):
                 _err(str(e))
 
     print()
-    print(_c(f"🔒 连续 {MAX_RETRIES} 次密码错误，程序退出。", _RED, _BOLD))
+    print(_c(f"🔒 连续 {MAX_RETRIES} 次密码错误。", _RED, _BOLD))
     _log("LOCKED: 连续密码错误达上限")
-    sys.exit(1)
+    raise VaultLocked(f"连续 {MAX_RETRIES} 次密码错误，已中止本次操作。")
 
 
 def _warn_weak_password(password):
@@ -1148,8 +1161,9 @@ def _view_in_memory(plaintext):
 
 def _extract_to_folder(plaintext):
     """解压到 decrypted/，看完安全删除。
-    用 atexit + 信号处理兜底：正常退出、Ctrl+C、SIGTERM、未捕获异常都会清除；
-    但 taskkill /F、任务管理器"结束任务"、断电属于强杀，无法运行清理代码。"""
+    清理兜底：正常退出、Ctrl+C（→ KeyboardInterrupt，由 finally 清理后返回菜单）、
+    SIGTERM/SIGBREAK（强杀信号，清理后退出）、未捕获异常、atexit 都会清除；
+    但 taskkill /F、任务管理器"结束任务"、断电无法运行清理代码。"""
     if DECRYPTED_DIR.exists():
         secure_delete_dir(DECRYPTED_DIR)
     DECRYPTED_DIR.mkdir(exist_ok=True)
@@ -1170,7 +1184,9 @@ def _extract_to_folder(plaintext):
 
     atexit.register(cleanup)
     prev_handlers = {}
-    for signame in ("SIGINT", "SIGTERM", "SIGBREAK"):
+    # SIGINT(Ctrl+C) 不接管：交给默认 KeyboardInterrupt，下面的 finally 会清理并冒泡回菜单。
+    # 只接管真正的强杀信号 SIGTERM/SIGBREAK：清理后退出。
+    for signame in ("SIGTERM", "SIGBREAK"):
         sig = getattr(signal, signame, None)
         if sig is None:
             continue
@@ -1763,12 +1779,42 @@ def _menu():
 
     choice = input("\n请选择: ").strip()
     if choice == "0":
-        return
+        return "exit"
     fn = numbered.get(choice)
     if fn:
         fn()
     else:
         _err("无效选择。")
+    return None
+
+
+def _menu_loop():
+    """持久菜单：只有选 [0] 或强制退出（关终端 / taskkill）才结束。
+
+    设计目标（用户明确要求）：除了 [0] 或强制退出，程序不主动退出。
+      - 操作正常结束 / 无效输入 / 操作抛异常 → 都回到菜单。
+      - 密码连续错误（VaultLocked）→ 提示后回菜单，而不是杀掉程序。
+      - Ctrl+C → 取消当前操作并回菜单（不退出）。
+      - 输入流结束（EOF，例如管道喂完）→ 退出，避免死循环。
+    """
+    while True:
+        try:
+            if _menu() == "exit":
+                break
+        except KeyboardInterrupt:
+            print(_c("\n已取消，返回菜单（要退出请选 [0]）。", _GREY))
+            continue
+        except EOFError:
+            break
+        except VaultLocked as e:
+            _err(str(e))
+        except Exception as e:
+            _err(f"操作出错：{e}")
+            _log(f"ERROR: {e!r}")
+        try:
+            input(_c("\n按 Enter 返回菜单…", _GREY))
+        except (EOFError, KeyboardInterrupt):
+            break
 
 
 # ───────────────────────── CLI 参数 ─────────────────────────
@@ -1832,6 +1878,8 @@ if __name__ == "__main__":
     _cleanup_stale_plaintext()
 
     if args.command:
+      # CLI 模式：单次执行；密码锁定 / 中断转为干净的退出码
+      try:
         if args.command == "encrypt":
             encrypt_mode(keyfile_path=args.keyfile)
         elif args.command == "decrypt":
@@ -1861,7 +1909,13 @@ if __name__ == "__main__":
                 _ok(f"已提取 {plen/1024:.1f} KB 到 {out}")
             except Exception as e:
                 _err(f"提取失败：{e}")
+      except VaultLocked as e:
+          _err(str(e))
+          sys.exit(1)
+      except KeyboardInterrupt:
+          print()
+          sys.exit(130)
     else:
-        # 交互菜单：始终可用，会根据当前状态（有/无库）自适应
-        _menu()
+        # 持久交互菜单：除了 [0] 或强制退出，程序不主动退出
+        _menu_loop()
     print()
