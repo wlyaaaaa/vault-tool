@@ -19,7 +19,7 @@
    请使用足够长的口令（建议 6+ 随机单词，或 16+ 位随机串）。
 """
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 import os
 import sys
@@ -37,6 +37,8 @@ import signal
 import argparse
 import time
 import logging
+import threading
+import subprocess
 import gc
 from pathlib import Path
 from getpass import getpass
@@ -56,6 +58,14 @@ if not _IS_WINDOWS:
         _HAS_CRYPTOGRAPHY = True
     except ImportError:
         pass
+
+# Argon2id（可选，PHC 竞赛冠军）：装了 argon2-cffi 才可用，否则回退 scrypt。
+_HAS_ARGON2 = False
+try:
+    from argon2.low_level import hash_secret_raw as _argon2_raw, Type as _Argon2Type
+    _HAS_ARGON2 = True
+except ImportError:
+    pass
 
 # ───────────────────────── 常量 ─────────────────────────
 
@@ -78,15 +88,30 @@ FLAG_COMPRESSED = 0x02   # 内层 tar 使用 gzip 压缩
 # 隐写术尾部魔数（追加到封面图片末尾）
 STEG_MAGIC = b"VLTSTEG1"
 
-# scrypt 参数：128 MB 内存 / 次猜测，让暴力破解的并行优势失效
-SCRYPT_N = 1 << 17        # 131072
+# scrypt 默认参数（直接调用 _pack_vault_v3 / 测试时的回退；交互加密会自动校准更强）
+SCRYPT_N = 1 << 17        # 131072，约 128 MB/次
 SCRYPT_R = 8
 SCRYPT_P = 1
-SCRYPT_MAXMEM = 256 * 1024 * 1024
 
-# 诱饵未启用时，slot1 填充的随机字节量（让"可能藏着隐藏卷"始终成立）
-PAD_MIN = 4096
-PAD_RANGE = 12288  # 实际填充 = PAD_MIN + random(0..PAD_RANGE)
+# KDF 自动校准目标与上限
+KDF_TARGET_SECONDS = 0.6           # 校准目标耗时（牺牲速度换内存硬度）
+SCRYPT_N_CAP = 1 << 20             # 校准上限 N=2^20（r=8 → 约 1 GB/次）
+ARGON2_TIME_COST = 3               # Argon2id 迭代轮数
+ARGON2_PARALLELISM = 4             # Argon2id 并行度
+ARGON2_MEM_CAP_KIB = 1 << 20       # 校准上限 1 GiB（KiB 计）
+MAX_KDF_MEM = 4 * 1024 * 1024 * 1024  # 解密时拒绝超过 4 GiB 的 KDF 参数（防篡改 DoS）
+
+# 解压总大小上限（防压缩炸弹；超过时询问是否继续）
+MAX_EXTRACT_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
+
+# 剪贴板自动清除秒数
+CLIPBOARD_CLEAR_SECONDS = 20
+
+# 尺寸分桶：让容器总大小只由"可见层"决定，尾部大小不泄露是否有隐藏卷
+PAD_FLOOR = 64 * 1024              # 最小桶 64 KiB（保证总有可信的自由空间）
+
+# 进程内缓存的已校准 KDF 参数：{("scrypt"/"argon2"): (kdf_id, a, b, c)}
+_KDF_PARAMS_CACHE = {}
 
 # 解密时直接打印到终端的文本类型与上限
 TEXT_EXT = {".txt", ".md", ".csv", ".log", ".json", ".ini", ".conf",
@@ -255,19 +280,123 @@ def _check_platform():
 
 # ───────────────────────── 密钥派生 ─────────────────────────
 
+def _password_material(password, keyfile_hash):
+    material = password.encode("utf-8") if isinstance(password, str) else bytes(password)
+    if keyfile_hash:
+        material = material + keyfile_hash
+    return material
+
+
 def derive_key_scrypt(password, salt, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P,
                       keyfile_hash=None):
     """scrypt 派生 32 字节密钥。
 
     password 可以是 str 或 bytes。若提供 keyfile_hash（SHA-256 摘要），
     则把它拼到密码材料之后实现"密码 + 密钥文件"双因子。
+    maxmem 按 N、r 动态计算，使任意（合法）参数都能工作。
     """
-    material = password.encode("utf-8") if isinstance(password, str) else bytes(password)
-    if keyfile_hash:
-        material = material + keyfile_hash
+    material = _password_material(password, keyfile_hash)
+    maxmem = 128 * n * r + (1 << 24)  # 实际需求 + 16 MB 余量
     return hashlib.scrypt(
-        material, salt=salt, n=n, r=r, p=p, dklen=32, maxmem=SCRYPT_MAXMEM,
+        material, salt=salt, n=n, r=r, p=p, dklen=32, maxmem=maxmem,
     )
+
+
+def derive_key_argon2id(password, salt, time_cost, memory_cost_kib, parallelism,
+                        keyfile_hash=None):
+    """Argon2id 派生 32 字节密钥（需 argon2-cffi）。"""
+    if not _HAS_ARGON2:
+        raise ValueError("此库使用 Argon2id 加密，请先安装：pip install argon2-cffi")
+    material = _password_material(password, keyfile_hash)
+    return _argon2_raw(
+        secret=material, salt=salt, time_cost=time_cost,
+        memory_cost=memory_cost_kib, parallelism=parallelism,
+        hash_len=32, type=_Argon2Type.ID,
+    )
+
+
+def _derive_key(kdf_id, password, salt, a, b, c, keyfile_hash=None):
+    """按 kdf_id 分派密钥派生。
+
+    kdf_id=1 scrypt：a=N, b=r, c=p（走 derive_key_scrypt，便于测试替身）。
+    kdf_id=2 argon2id：a=time_cost, b=memory_cost(KiB), c=parallelism。
+    """
+    if kdf_id == 1:
+        return derive_key_scrypt(password, salt, a, b, c, keyfile_hash)
+    if kdf_id == 2:
+        return derive_key_argon2id(password, salt, a, b, c, keyfile_hash)
+    raise ValueError("未知的 KDF id")
+
+
+def _validate_kdf(kdf_id, a, b, c):
+    """解密前校验 KDF 参数，拒绝被篡改成的超大内存需求（防 DoS）。"""
+    if kdf_id == 1:
+        if a < 2 or (a & (a - 1)) != 0:
+            raise ValueError("scrypt N 必须是 2 的幂")
+        if 128 * a * b > MAX_KDF_MEM:
+            raise ValueError("KDF 内存参数过大，拒绝执行")
+    elif kdf_id == 2:
+        if not _HAS_ARGON2:
+            raise ValueError("此库使用 Argon2id 加密，请先安装：pip install argon2-cffi")
+        if b * 1024 > MAX_KDF_MEM:
+            raise ValueError("KDF 内存参数过大，拒绝执行")
+    else:
+        raise ValueError("未知的 KDF id")
+
+
+def _calibrate_kdf(kind):
+    """校准 KDF 参数到约 KDF_TARGET_SECONDS。返回 (kdf_id, a, b, c)。"""
+    salt = b"calibration-salt"
+    if kind == "argon2" and _HAS_ARGON2:
+        mem = 1 << 16  # 64 MiB（KiB）
+        while True:
+            t0 = time.perf_counter()
+            _derive_key(2, "calib", salt, ARGON2_TIME_COST, mem, ARGON2_PARALLELISM)
+            if time.perf_counter() - t0 >= KDF_TARGET_SECONDS or mem >= ARGON2_MEM_CAP_KIB:
+                break
+            mem <<= 1
+        return (2, ARGON2_TIME_COST, min(mem, ARGON2_MEM_CAP_KIB), ARGON2_PARALLELISM)
+    # scrypt
+    n = 1 << 14
+    while True:
+        t0 = time.perf_counter()
+        _derive_key(1, "calib", salt, n, SCRYPT_R, SCRYPT_P)
+        if time.perf_counter() - t0 >= KDF_TARGET_SECONDS or n >= SCRYPT_N_CAP:
+            break
+        n <<= 1
+    return (1, min(n, SCRYPT_N_CAP), SCRYPT_R, SCRYPT_P)
+
+
+def _get_kdf_params(kind="scrypt"):
+    """取已校准的 KDF 参数（进程内缓存，避免每次加密都重新校准）。"""
+    if kind == "argon2" and not _HAS_ARGON2:
+        kind = "scrypt"
+    if kind not in _KDF_PARAMS_CACHE:
+        print(_c(f"⏳ 正在校准密钥派生强度（{kind}，目标约 {KDF_TARGET_SECONDS}s）...", _GREY))
+        _KDF_PARAMS_CACHE[kind] = _calibrate_kdf(kind)
+        kid, a, b, c = _KDF_PARAMS_CACHE[kind]
+        if kid == 1:
+            print(_c(f"   scrypt N=2^{a.bit_length()-1}, r={b}（约 {128*a*b//1024//1024} MB/次）", _GREY))
+        else:
+            print(_c(f"   Argon2id t={a}, m={b//1024} MiB, p={c}", _GREY))
+    return _KDF_PARAMS_CACHE[kind]
+
+
+def _bucket_size(visible_len):
+    """根据"可见层"长度算出容器目标总大小。
+
+    关键不变量：总大小只由可见层（slot0 / 诱饵）决定，与隐藏层是否存在、多大无关。
+    这样尾部大小不会泄露隐藏卷的存在——这是似真否认成立的前提。
+    同时保证有"与可见内容相当"的自由空间（≈visible_len），让每个库都"可能藏着"隐藏卷。
+    """
+    target = max(visible_len * 2, PAD_FLOOR)
+    if target <= 64 * 1024 * 1024:
+        p = PAD_FLOOR
+        while p < target:
+            p <<= 1
+        return p
+    step = 16 * 1024 * 1024
+    return ((target + step - 1) // step) * step
 
 
 def derive_key_pbkdf2(password, salt):  # 仅用于兼容旧版 VAULT01
@@ -482,6 +611,63 @@ def _pause_or_panic(prompt, panic_cb):
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
             sys.stdout.write("\n")
+
+
+# ───────────────────────── 剪贴板（取密码 + 自动清除） ─────────────────────────
+
+def _copy_to_clipboard(text):
+    """复制文本到系统剪贴板。成功返回 True。"""
+    if _IS_WINDOWS:
+        try:
+            u32 = ctypes.WinDLL("user32")
+            k32 = ctypes.WinDLL("kernel32")
+            CF_UNICODETEXT = 13
+            GMEM_MOVEABLE = 0x0002
+            data = text.encode("utf-16-le") + b"\x00\x00"
+            k32.GlobalAlloc.restype = ctypes.c_void_p
+            k32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+            k32.GlobalLock.restype = ctypes.c_void_p
+            k32.GlobalLock.argtypes = [ctypes.c_void_p]
+            k32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+            u32.OpenClipboard.argtypes = [ctypes.c_void_p]
+            u32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+            u32.SetClipboardData.restype = ctypes.c_void_p
+            h = k32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+            if not h:
+                return False
+            ptr = k32.GlobalLock(h)
+            ctypes.memmove(ptr, data, len(data))
+            k32.GlobalUnlock(h)
+            if not u32.OpenClipboard(None):
+                return False
+            try:
+                u32.EmptyClipboard()
+                if not u32.SetClipboardData(CF_UNICODETEXT, ctypes.c_void_p(h)):
+                    return False
+                # 所有权已移交剪贴板，不要再 free h
+            finally:
+                u32.CloseClipboard()
+            return True
+        except Exception:
+            return False
+    # macOS / Linux
+    for cmd in (["pbcopy"], ["xclip", "-selection", "clipboard"],
+                ["xsel", "--clipboard", "--input"]):
+        try:
+            subprocess.run(cmd, input=text.encode("utf-8"), check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _clear_clipboard_later(seconds):
+    """后台守护线程：到点把剪贴板清空（程序若已退出则不保证）。"""
+    def worker():
+        time.sleep(seconds)
+        _copy_to_clipboard("")
+    threading.Thread(target=worker, daemon=True).start()
 
 
 # ───────────────────────── 安全删除 ─────────────────────────
@@ -713,22 +899,29 @@ def _unpack_vault(password, blob):
 
 def _pack_vault_v3(real_password, real_plaintext, *,
                    decoy_password=None, decoy_plaintext=None,
-                   keyfile_hash=None, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P):
-    """打包成 VAULT03 双槽容器。
+                   keyfile_hash=None, kdf=None):
+    """打包成 VAULT03 双槽容器（含尺寸分桶 + 密文内填充的隐藏层）。
 
     布局：
-      header_prefix = MAGIC(7) + flags(1) + scrypt 参数(13)        = 21 bytes
+      header_prefix = MAGIC(7) + flags(1) + KDF 参数(13: id,a,b,c)   = 21 bytes
       slot0 = salt_len(2)+salt(32) + nonce_len(2)+nonce(12)
               + tag(16) + ct_len(8) + ciphertext0                 ← 显式定长（"被交出"的那层）
       slot1 = salt(32) + nonce(12) + tag(16) + ciphertext...到 EOF ← 长度不标注（隐藏层 / 随机填充）
 
-    若提供 decoy_*，则 slot0=诱饵、slot1=真实（隐藏层）；
-    否则 slot0=真实、slot1=纯随机填充。两种情况密文均不可区分。
+    关键设计：
+      - 总大小 = _bucket_size(header+slot0)，只由"可见层"决定，与隐藏层无关 → 尾部大小不泄露。
+      - 隐藏层明文 = 真实长度(8) + 真实数据 + 随机填充，整体加密；尾部因此被占满，
+        与"纯随机填充"在密文上不可区分。
+      - 若提供 decoy_*：slot0=诱饵、slot1=真实（隐藏）；否则 slot0=真实、slot1=纯随机。
     """
+    if kdf is None:
+        kdf = (1, SCRYPT_N, SCRYPT_R, SCRYPT_P)
+    kdf_id, a, b, c = kdf
+
     flags = FLAG_COMPRESSED
     if keyfile_hash:
         flags |= FLAG_KEYFILE
-    header_prefix = MAGIC_V3 + bytes([flags]) + struct.pack(">BIII", 1, n, r, p)
+    header_prefix = MAGIC_V3 + bytes([flags]) + struct.pack(">BIII", kdf_id, a, b, c)
 
     if decoy_password is not None:
         s0_pw, s0_pt = decoy_password, decoy_plaintext
@@ -740,7 +933,7 @@ def _pack_vault_v3(real_password, real_plaintext, *,
     # ── slot0（定长、可被交出的一层） ──
     salt0 = secrets.token_bytes(32)
     nonce0 = secrets.token_bytes(12)
-    key0 = derive_key_scrypt(s0_pw, salt0, n, r, p, keyfile_hash)
+    key0 = _derive_key(kdf_id, s0_pw, salt0, a, b, c, keyfile_hash)
     aad0 = header_prefix + salt0 + nonce0
     pt0 = bytes(s0_pt) if isinstance(s0_pt, bytearray) else s0_pt
     ct0, tag0 = _aes_gcm("encrypt", key0, nonce0, pt0, aad=aad0)
@@ -748,18 +941,30 @@ def _pack_vault_v3(real_password, real_plaintext, *,
              + struct.pack(">H", len(nonce0)) + nonce0
              + tag0 + struct.pack(">Q", len(ct0)) + ct0)
 
-    # ── slot1（隐藏层 或 随机填充，长度不在密文中标注） ──
-    if s1_pw is not None:
+    # ── 尾部目标长度：由"可见层"经分桶决定（与隐藏层无关 → 不泄露隐藏卷） ──
+    visible_len = len(header_prefix) + len(slot0)
+    slot1_len = max(_bucket_size(visible_len) - visible_len, 60)
+
+    if s1_pw is None:
+        # 无诱饵：尾部纯随机填充
+        slot1 = secrets.token_bytes(slot1_len)
+    else:
+        # 有诱饵：真实层加密进尾部，并用"密文内填充"占满，使尾部长度与无诱饵时一致
         salt1 = secrets.token_bytes(32)
         nonce1 = secrets.token_bytes(12)
-        key1 = derive_key_scrypt(s1_pw, salt1, n, r, p, keyfile_hash)
-        aad1 = salt1 + nonce1
+        key1 = _derive_key(kdf_id, s1_pw, salt1, a, b, c, keyfile_hash)
         pt1 = bytes(s1_pt) if isinstance(s1_pt, bytearray) else s1_pt
-        ct1, tag1 = _aes_gcm("encrypt", key1, nonce1, pt1, aad=aad1)
+        inner_len = slot1_len - 60          # = len(明文) = len(密文)
+        need = 8 + len(pt1)
+        if need > inner_len:
+            cap = max(0, inner_len - 8)
+            raise ValueError(
+                f"诱饵容量不足：真实数据约 {len(pt1)//1024} KB，但当前诱饵只能藏下约 "
+                f"{cap//1024} KB。请在 decoy_source/ 放入更多/更大的诱饵文件"
+                "（诱饵应不小于真实数据），再重试。")
+        inner = struct.pack(">Q", len(pt1)) + pt1 + secrets.token_bytes(inner_len - need)
+        ct1, tag1 = _aes_gcm("encrypt", key1, nonce1, inner, aad=salt1 + nonce1)
         slot1 = salt1 + nonce1 + tag1 + ct1
-    else:
-        pad = PAD_MIN + secrets.randbelow(PAD_RANGE + 1)
-        slot1 = secrets.token_bytes(max(pad, 60))
 
     return header_prefix + slot0 + slot1
 
@@ -772,10 +977,8 @@ def _unpack_vault_v3(password, blob, keyfile_hash=None):
     """
     if blob[:7] != MAGIC_V3:
         raise ValueError("不是 VAULT03 容器")
-    flags = blob[7]
-    kdf_id, n, r, p = struct.unpack(">BIII", blob[8:21])
-    if kdf_id != 1:
-        raise ValueError("unknown KDF id")
+    kdf_id, a, b, c = struct.unpack(">BIII", blob[8:21])
+    _validate_kdf(kdf_id, a, b, c)
     header_prefix = blob[:21]
     pos = 21
 
@@ -789,7 +992,7 @@ def _unpack_vault_v3(password, blob, keyfile_hash=None):
     slot1_region = blob[pos:]
 
     # 尝试 slot0
-    key0 = derive_key_scrypt(password, salt0, n, r, p, keyfile_hash)
+    key0 = _derive_key(kdf_id, password, salt0, a, b, c, keyfile_hash)
     aad0 = header_prefix + salt0 + nonce0
     pt0 = _try_gcm_decrypt(key0, nonce0, ct0, aad0, tag0)
     if pt0 is not None:
@@ -801,10 +1004,12 @@ def _unpack_vault_v3(password, blob, keyfile_hash=None):
         nonce1 = slot1_region[32:44]
         tag1 = slot1_region[44:60]
         ct1 = slot1_region[60:]
-        key1 = derive_key_scrypt(password, salt1, n, r, p, keyfile_hash)
-        pt1 = _try_gcm_decrypt(key1, nonce1, ct1, salt1 + nonce1, tag1)
-        if pt1 is not None:
-            return bytearray(pt1), 1
+        key1 = _derive_key(kdf_id, password, salt1, a, b, c, keyfile_hash)
+        inner = _try_gcm_decrypt(key1, nonce1, ct1, salt1 + nonce1, tag1)
+        if inner is not None and len(inner) >= 8:
+            real_len = struct.unpack(">Q", inner[:8])[0]
+            if real_len <= len(inner) - 8:   # 防御旧格式 / 垃圾：长度前缀必须自洽
+                return bytearray(inner[8:8 + real_len]), 1
 
     raise ValueError("密码错误或文件已被篡改")
 
@@ -843,10 +1048,28 @@ def vault_flags(path):
 
 # ───────────────────── tar 安全处理 ─────────────────────
 
-def _safe_extractall(tar, dest):
-    """带路径遍历防护的 tar 解压。跳过试图逃逸到 dest 之外的成员。"""
+def _tar_total_size(tar):
+    """tar 内所有成员声明的解压后总大小（用于压缩炸弹防护，无需真正解压）。"""
+    return sum(m.size for m in tar.getmembers() if m.isfile())
+
+
+def _confirm_if_huge(total):
+    """若解压总大小超过上限，提示并要求确认。返回是否继续。"""
+    if total <= MAX_EXTRACT_SIZE:
+        return True
+    _warn(f"解压后总大小约 {total/1024/1024:.0f} MB，超过安全上限 "
+          f"{MAX_EXTRACT_SIZE/1024/1024:.0f} MB（可能是异常/压缩炸弹）。")
+    return input("仍要继续吗？(yes/no): ").strip().lower() in ("y", "yes")
+
+
+def _safe_extractall(tar, dest, name_filter=None):
+    """带路径遍历防护的 tar 解压。跳过逃逸到 dest 之外的成员；
+    name_filter 非空时只解压名字含该子串的文件（选择性提取）。"""
     dest = Path(dest).resolve()
+    nf = name_filter.lower() if name_filter else None
     for member in tar.getmembers():
+        if nf and nf not in member.name.lower():
+            continue
         member_path = (dest / member.name).resolve()
         if not str(member_path).startswith(str(dest) + os.sep) and member_path != dest:
             _warn(f"跳过危险路径：{member.name}")
@@ -941,7 +1164,7 @@ def _read_password_twice(prompt1, prompt2):
 
 # ───────────────────────── 加密 ─────────────────────────
 
-def encrypt_mode(overwrite=False, keyfile_path=None):
+def encrypt_mode(overwrite=False, keyfile_path=None, kdf_choice="scrypt"):
     _check_platform()
     _init_colors()
     _banner("🔐 加密模式")
@@ -970,10 +1193,12 @@ def encrypt_mode(overwrite=False, keyfile_path=None):
     if not password:
         return
 
+    kdf = _get_kdf_params("argon2" if kdf_choice == "argon2" else "scrypt")
+
     print(_c("\n⏳ 正在打包并压缩文件 ...", _GREY))
     plaintext = _make_tar(files)
-    print(_c("⏳ 正在派生密钥（scrypt，约 128MB 内存，可能需要数秒）...", _GREY))
-    blob = _pack_vault_v3(password, plaintext, keyfile_hash=keyfile_hash)
+    print(_c("⏳ 正在派生密钥（内存硬，可能需要数秒）...", _GREY))
+    blob = _pack_vault_v3(password, plaintext, keyfile_hash=keyfile_hash, kdf=kdf)
 
     # 删除原文前先自检：确认这把密码（+密钥文件）真能解开新库
     print(_c("⏳ 写入前自检（确认可解密）...", _GREY))
@@ -1046,7 +1271,12 @@ def decrypt_mode(force_no_disk=False, force_extract=False, keyfile_path=None):
             choice = input("选择 [1/2，回车=1]: ").strip() or "1"
 
         if choice == "2":
-            _extract_to_folder(plaintext)
+            name_filter = None
+            if not force_extract:
+                name_filter = input(
+                    "要提取哪些文件？(回车=全部，或输入关键字只提取匹配的): "
+                ).strip() or None
+            _extract_to_folder(plaintext, name_filter)
         else:
             _view_in_memory(plaintext)
     finally:
@@ -1096,7 +1326,28 @@ def _view_in_memory(plaintext):
         text_ok = {m.name: (Path(m.name).suffix.lower() in TEXT_EXT
                             and m.size <= TEXT_PRINT_LIMIT) for m in members}
         print(f"共 {_c(str(len(members)), _BOLD)} 个文件。")
-        print(_c("输入关键字搜索文件名（/前缀=按内容搜索）；回车=全部；:q 结束。", _GREY))
+        print(_c("命令：关键字=按文件名搜索  /关键字=按内容搜索  "
+                 ":copy 名字=复制到剪贴板  回车=全部  :q 结束", _GREY))
+
+        def copy_member(term):
+            """把首个匹配的文本文件内容复制到剪贴板，并安排自动清除。"""
+            cands = [m for m in members if term.lower() in m.name.lower()
+                     and text_ok.get(m.name)]
+            if not cands:
+                _warn(f"没有匹配 “{term}” 的可复制文本文件。")
+                return
+            m = sorted(cands, key=lambda x: x.name)[0]
+            try:
+                content = tar.extractfile(m).read().decode("utf-8")
+            except Exception:
+                _err("无法读取该文件内容。")
+                return
+            if _copy_to_clipboard(content):
+                _clear_clipboard_later(CLIPBOARD_CLEAR_SECONDS)
+                _ok(f"已复制 {m.name} 到剪贴板，"
+                    f"{CLIPBOARD_CLEAR_SECONDS} 秒后自动清除（请勿在此前关闭程序）。")
+            else:
+                _err("复制失败：当前环境无法访问剪贴板。")
 
         def show(selected):
             if not selected:
@@ -1127,6 +1378,13 @@ def _view_in_memory(plaintext):
                 break
             if q == ":q":
                 break
+            if q.startswith(":copy"):  # 复制到剪贴板
+                term = q[len(":copy"):].strip()
+                if term:
+                    copy_member(term)
+                else:
+                    _warn("用法：:copy 文件名关键字")
+                continue
             if not q:
                 show(members)
                 continue
@@ -1159,7 +1417,7 @@ def _view_in_memory(plaintext):
     _ok("屏幕已清除。明文仅存在于刚才的显示中，现已不可恢复。\n")
 
 
-def _extract_to_folder(plaintext):
+def _extract_to_folder(plaintext, name_filter=None):
     """解压到 decrypted/，看完安全删除。
     清理兜底：正常退出、Ctrl+C（→ KeyboardInterrupt，由 finally 清理后返回菜单）、
     SIGTERM/SIGBREAK（强杀信号，清理后退出）、未捕获异常、atexit 都会清除；
@@ -1197,10 +1455,17 @@ def _extract_to_folder(plaintext):
 
     try:
         with tarfile.open(fileobj=io.BytesIO(bytes(plaintext)), mode="r") as tar:
-            _safe_extractall(tar, DECRYPTED_DIR)
+            if not _confirm_if_huge(_tar_total_size(tar)):
+                _warn("已取消解压。")
+                return
+            _safe_extractall(tar, DECRYPTED_DIR, name_filter)
 
         extracted = sorted(p for p in DECRYPTED_DIR.rglob("*") if p.is_file())
-        _ok(f"已解密 {len(extracted)} 个文件到：{DECRYPTED_DIR}\n")
+        if name_filter and not extracted:
+            _warn(f"没有文件名匹配 “{name_filter}”，未提取任何文件。")
+            return
+        _ok(f"已解密 {len(extracted)} 个文件到：{DECRYPTED_DIR}"
+            + (f"（筛选：{name_filter}）" if name_filter else "") + "\n")
         for f in extracted:
             rel = f.relative_to(DECRYPTED_DIR).as_posix()
             size = f.stat().st_size
@@ -1303,11 +1568,11 @@ def setup_decoy_mode(keyfile_path=None):
         decoy_plaintext = _make_tar(decoy_files, DECOY_SOURCE_DIR)
 
         # 4) 打包双层容器：slot0=诱饵（被交出），slot1=隐藏的真实层
-        print(_c("\n⏳ 生成双层容器（scrypt × 2，可能需要数秒）...", _GREY))
+        print(_c("\n⏳ 生成双层容器（内存硬 KDF × 2，可能需要数秒）...", _GREY))
         new_blob = _pack_vault_v3(
             real_password, real_plaintext,
             decoy_password=decoy_password, decoy_plaintext=decoy_plaintext,
-            keyfile_hash=keyfile_hash)
+            keyfile_hash=keyfile_hash, kdf=_get_kdf_params("scrypt"))
 
         # 5) 双向自检：真密码→真实数据，诱饵密码→诱饵数据
         try:
@@ -1450,8 +1715,9 @@ def migrate_mode(keyfile_path=None):
         shutil.copy2(VAULT_FILE, backup)
         print(_c(f"📦 已备份旧库到：{backup.name}", _GREY))
 
-        print(_c("⏳ 用 VAULT03（scrypt + AES-256-GCM）重新加密 ...", _GREY))
-        new_blob = _pack_vault_v3(password, plaintext, keyfile_hash=keyfile_hash)
+        print(_c("⏳ 用 VAULT03（内存硬 KDF + AES-256-GCM）重新加密 ...", _GREY))
+        new_blob = _pack_vault_v3(password, plaintext, keyfile_hash=keyfile_hash,
+                                  kdf=_get_kdf_params("scrypt"))
 
         # 自检
         try:
@@ -1528,8 +1794,9 @@ def change_password_mode(keyfile_path=None):
         backup = VAULT_FILE.with_suffix(".enc.pwbak")
         shutil.copy2(VAULT_FILE, backup)
 
-        print(_c("\n⏳ 用新密码重新加密（scrypt，可能需要数秒）...", _GREY))
-        new_blob = _pack_vault_v3(new_password, plaintext, keyfile_hash=new_keyfile_hash)
+        print(_c("\n⏳ 用新密码重新加密（内存硬 KDF，可能需要数秒）...", _GREY))
+        new_blob = _pack_vault_v3(new_password, plaintext, keyfile_hash=new_keyfile_hash,
+                                  kdf=_get_kdf_params("scrypt"))
 
         try:
             check, _ = _decrypt_blob(new_password, new_blob, new_keyfile_hash)
@@ -1581,17 +1848,25 @@ def vault_info():
 
     if ver == 3:
         flags = blob[7]
-        kdf_id, n, r, p = struct.unpack(">BIII", blob[8:21])
+        kdf_id, a, b, c = struct.unpack(">BIII", blob[8:21])
         pos = 21
         salt_len = struct.unpack(">H", blob[pos:pos + 2])[0]; pos += 2 + salt_len
         nonce_len = struct.unpack(">H", blob[pos:pos + 2])[0]; pos += 2 + nonce_len
         pos += 16
         ct_len0 = struct.unpack(">Q", blob[pos:pos + 8])[0]; pos += 8
         slot1_len = len(blob) - (pos + ct_len0)
-        n_exp = n.bit_length() - 1
 
-        print(f"  格式：{_c('VAULT03（scrypt + AES-256-GCM）', _GREEN)}")
-        print(f"  KDF：scrypt（N=2^{n_exp}, r={r}, p={p}，约 {n * r * 128 // 1024 // 1024} MB/次）")
+        if kdf_id == 1:
+            kdf_desc = (f"scrypt（N=2^{a.bit_length()-1}, r={b}, p={c}，"
+                        f"约 {a * b * 128 // 1024 // 1024} MB/次）")
+        elif kdf_id == 2:
+            kdf_desc = (f"Argon2id（t={a}, m={b//1024} MiB, p={c}）"
+                        + ("" if _HAS_ARGON2 else _c("  ⚠️ 本机未装 argon2-cffi，无法解密", _RED)))
+        else:
+            kdf_desc = f"未知（id={kdf_id}）"
+
+        print(f"  格式：{_c('VAULT03（' + ('Argon2id' if kdf_id == 2 else 'scrypt') + ' + AES-256-GCM）', _GREEN)}")
+        print(f"  KDF：{kdf_desc}")
         print(f"  压缩：{'是（tar+gzip）' if flags & FLAG_COMPRESSED else '否'}")
         print(f"  密钥文件：{_c('需要（双因子）', _MAGENTA) if flags & FLAG_KEYFILE else '否'}")
         print(f"  主层密文：{ct_len0:,} bytes（{ct_len0/1024:.1f} KB）")
@@ -1615,6 +1890,41 @@ def vault_info():
 
     print()
     _log("INFO: 查看库信息")
+
+
+def _find_backups():
+    """列出磁盘上的库备份文件。"""
+    pats = ("*.enc.bak", "*.enc.pwbak", "*.enc.v1bak", "*.pwbak")
+    found = []
+    for pat in pats:
+        found.extend(BASE.glob(pat))
+    # 去重
+    return sorted(set(found))
+
+
+def clean_backups_mode():
+    """安全删除升级 / 改密码留下的库备份文件。"""
+    _init_colors()
+    _banner("🧹 清理备份文件")
+    backups = _find_backups()
+    if not backups:
+        _info("没有发现备份文件，无需清理。")
+        return
+    print("\n发现以下备份（确认现库可正常解密后再删）：")
+    total = 0
+    for b in backups:
+        sz = b.stat().st_size
+        total += sz
+        print(f"   • {b.name}  ({sz/1024:.1f} KB)")
+    ans = input(_c(f"\n确定安全删除这 {len(backups)} 个备份（共 {total/1024:.1f} KB）？(yes/no): ",
+                   _YELLOW)).strip().lower()
+    if ans not in ("y", "yes"):
+        print("已取消")
+        return
+    for b in backups:
+        secure_delete(b)
+    _ok(f"已安全删除 {len(backups)} 个备份文件。")
+    _log(f"CLEAN_BACKUPS: 删除 {len(backups)} 个备份")
 
 
 # ───────────────────────── 加密 / 添加文件（引导式） ─────────────────────────
@@ -1745,6 +2055,8 @@ def _menu():
     if has_vault:
         manage.append(("🔑 修改密码 / 密钥文件", lambda: change_password_mode()))
         manage.append(("📋 查看库信息（不需要密码）", vault_info))
+    if _find_backups():
+        manage.append(("🧹 清理备份文件", clean_backups_mode))
     if manage:
         groups.append(("管理", manage))
 
@@ -1830,6 +2142,8 @@ def _parse_args():
 
     enc = sub.add_parser("encrypt", help="加密 source/ 到 vault.enc")
     enc.add_argument("--keyfile", help="使用密钥文件作为第二因子")
+    enc.add_argument("--kdf", choices=["scrypt", "argon2"], default="scrypt",
+                     help="密钥派生算法（argon2 需 argon2-cffi；默认 scrypt 零依赖）")
 
     dec = sub.add_parser("decrypt", help="解密查看 vault.enc")
     dec_group = dec.add_mutually_exclusive_group()
@@ -1881,7 +2195,7 @@ if __name__ == "__main__":
       # CLI 模式：单次执行；密码锁定 / 中断转为干净的退出码
       try:
         if args.command == "encrypt":
-            encrypt_mode(keyfile_path=args.keyfile)
+            encrypt_mode(keyfile_path=args.keyfile, kdf_choice=args.kdf)
         elif args.command == "decrypt":
             decrypt_mode(force_no_disk=args.no_disk, force_extract=args.extract,
                          keyfile_path=args.keyfile)

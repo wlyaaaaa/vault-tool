@@ -733,6 +733,192 @@ class TestMenuLoop(unittest.TestCase):
             vault_tool._menu_loop()  # EOF 应跳出，不死循环
 
 
+class TestBucketingDeniability(unittest.TestCase):
+    """尺寸分桶：容器总大小只由可见层决定，与隐藏层无关。"""
+
+    def test_size_independent_of_hidden(self):
+        visible = b"primary visible layer " * 20
+        v_none = vault_tool._pack_vault_v3("p", visible)
+        v_small = vault_tool._pack_vault_v3(
+            "real", b"x", decoy_password="p", decoy_plaintext=visible)
+        v_big = vault_tool._pack_vault_v3(
+            "real", b"Z" * 40000, decoy_password="p", decoy_plaintext=visible)
+        self.assertEqual(len(v_none), len(v_small))
+        self.assertEqual(len(v_small), len(v_big))
+        self.assertEqual(len(v_none), 65536)  # 64KB 桶
+
+    def test_bucket_grows_with_visible(self):
+        small = vault_tool._pack_vault_v3("p", b"a" * 10)
+        big = vault_tool._pack_vault_v3("p", b"a" * 200000)
+        self.assertLess(len(small), len(big))
+        self.assertEqual(len(small), 65536)
+        self.assertEqual(len(big), 512 * 1024)
+
+    def test_bucket_size_helper(self):
+        self.assertEqual(vault_tool._bucket_size(100), 65536)
+        self.assertEqual(vault_tool._bucket_size(200000), 512 * 1024)
+        self.assertEqual(vault_tool._bucket_size(70 * 1024 * 1024) % (16 * 1024 * 1024), 0)
+
+    def test_decoy_capacity_error(self):
+        with self.assertRaises(ValueError) as cm:
+            vault_tool._pack_vault_v3(
+                "real", b"R" * 200000, decoy_password="d", decoy_plaintext=b"tiny")
+        self.assertIn("诱饵容量不足", str(cm.exception))
+
+
+class TestArgon2(unittest.TestCase):
+    """Argon2id KDF（需 argon2-cffi）。"""
+
+    @unittest.skipUnless(vault_tool._HAS_ARGON2, "argon2-cffi 未安装")
+    def test_roundtrip_and_decoy(self):
+        kdf = (2, 1, 8192, 1)  # t=1, m=8MiB, p=1（测试用轻量参数）
+        blob = vault_tool._pack_vault_v3("argonpw", b"secret", kdf=kdf)
+        self.assertEqual(blob[8], 2)  # kdf_id
+        pt, _ = vault_tool._unpack_vault_v3("argonpw", blob)
+        self.assertEqual(bytes(pt), b"secret")
+        with self.assertRaises(ValueError):
+            vault_tool._unpack_vault_v3("wrong", blob)
+        d = vault_tool._pack_vault_v3(
+            "rp", b"REAL", decoy_password="dp", decoy_plaintext=b"DECOY", kdf=kdf)
+        pr, lr = vault_tool._unpack_vault_v3("rp", d)
+        pd, ld = vault_tool._unpack_vault_v3("dp", d)
+        self.assertEqual((bytes(pr), lr), (b"REAL", 1))
+        self.assertEqual((bytes(pd), ld), (b"DECOY", 0))
+
+
+class TestKdfValidation(unittest.TestCase):
+    """解密前 KDF 参数防篡改校验。"""
+
+    def test_reject_huge_scrypt_mem(self):
+        with self.assertRaises(ValueError):
+            vault_tool._validate_kdf(1, 1 << 30, 8, 1)
+
+    def test_reject_non_power_of_two_n(self):
+        with self.assertRaises(ValueError):
+            vault_tool._validate_kdf(1, 100, 8, 1)
+
+    def test_reject_unknown_kdf(self):
+        with self.assertRaises(ValueError):
+            vault_tool._validate_kdf(9, 1, 1, 1)
+
+    def test_accept_valid_scrypt(self):
+        vault_tool._validate_kdf(1, 1 << 17, 8, 1)  # 不应抛
+
+
+class TestDeriveMaxmem(unittest.TestCase):
+    """maxmem 动态化：高 N 不再被固定 256MB 上限卡死。"""
+
+    def test_high_n_succeeds(self):
+        # N=2^19, r=8 → 512MB；旧的固定 256MB maxmem 会抛 ValueError
+        key = vault_tool.derive_key_scrypt("pw", b"saltsaltsaltsalt", n=1 << 19, r=8, p=1)
+        self.assertEqual(len(key), 32)
+
+
+class TestKdfCalibration(unittest.TestCase):
+    """KDF 自动校准返回合法参数。"""
+
+    def setUp(self):
+        vault_tool._KDF_PARAMS_CACHE.clear()
+
+    def tearDown(self):
+        vault_tool._KDF_PARAMS_CACHE.clear()
+
+    def test_scrypt_calibration(self):
+        kid, a, b, c = vault_tool._calibrate_kdf("scrypt")
+        self.assertEqual(kid, 1)
+        self.assertEqual(a & (a - 1), 0)             # 2 的幂
+        self.assertLessEqual(a, vault_tool.SCRYPT_N_CAP)
+
+
+class TestSelectiveExtract(unittest.TestCase):
+    """选择性提取：name_filter 只解出匹配的文件。"""
+
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp())
+        self.dest = self.tmpdir / "out"
+        self.dest.mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _tar(self, *names):
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tar:
+            for n in names:
+                info = tarfile.TarInfo(name=n)
+                data = n.encode()
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+        buf.seek(0)
+        return buf
+
+    def test_filter_extracts_only_matching(self):
+        buf = self._tar("apple.txt", "banana.txt", "apricot.md")
+        with tarfile.open(fileobj=buf, mode="r") as tar:
+            vault_tool._safe_extractall(tar, self.dest, name_filter="ap")
+        names = {p.name for p in self.dest.rglob("*") if p.is_file()}
+        self.assertEqual(names, {"apple.txt", "apricot.md"})
+
+    def test_no_filter_extracts_all(self):
+        buf = self._tar("a.txt", "b.txt")
+        with tarfile.open(fileobj=buf, mode="r") as tar:
+            vault_tool._safe_extractall(tar, self.dest)
+        names = {p.name for p in self.dest.rglob("*") if p.is_file()}
+        self.assertEqual(names, {"a.txt", "b.txt"})
+
+
+class TestExtractSizeGuard(unittest.TestCase):
+    """压缩炸弹防护：超过上限需确认。"""
+
+    def test_small_passes(self):
+        self.assertTrue(vault_tool._confirm_if_huge(1024))
+
+    def test_huge_requires_confirm_no(self):
+        with mock.patch("builtins.input", return_value="no"), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(vault_tool._confirm_if_huge(vault_tool.MAX_EXTRACT_SIZE + 1))
+
+    def test_huge_confirm_yes(self):
+        with mock.patch("builtins.input", return_value="yes"), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(vault_tool._confirm_if_huge(vault_tool.MAX_EXTRACT_SIZE + 1))
+
+
+class TestCleanBackups(unittest.TestCase):
+    """清理备份：找出并安全删除 .bak/.pwbak。"""
+
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp())
+        self._orig_base = vault_tool.BASE
+        vault_tool.BASE = self.tmpdir
+
+    def tearDown(self):
+        vault_tool.BASE = self._orig_base
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_find_and_clean(self):
+        (self.tmpdir / "vault.enc.bak").write_bytes(b"x" * 100)
+        (self.tmpdir / "vault.enc.pwbak").write_bytes(b"y" * 100)
+        (self.tmpdir / "vault.enc").write_bytes(b"keep")  # 不是备份
+        self.assertEqual(len(vault_tool._find_backups()), 2)
+        with mock.patch("builtins.input", return_value="yes"), \
+             contextlib.redirect_stdout(io.StringIO()):
+            vault_tool.clean_backups_mode()
+        self.assertEqual(vault_tool._find_backups(), [])
+        self.assertTrue((self.tmpdir / "vault.enc").exists())  # 主库保留
+
+
+class TestClipboard(unittest.TestCase):
+    """剪贴板复制（冒烟测试：不崩溃、返回布尔）。"""
+
+    def test_copy_returns_bool(self):
+        result = vault_tool._copy_to_clipboard("test-secret")
+        self.assertIsInstance(result, bool)
+
+    def test_schedule_clear_no_crash(self):
+        vault_tool._clear_clipboard_later(0.01)  # 不应抛
+
+
 class TestMakeTarGzipMtime(unittest.TestCase):
     """tar.gz 头部 mtime 应固定为 0（去元数据），且仍可往返。"""
 
