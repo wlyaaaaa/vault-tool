@@ -44,6 +44,16 @@
 
 ## 使用方法
 
+### 给 `wlyaaaaa/Key` 做私有密文备份
+
+`vault-tool` 是公开工具仓库，`Key` 仓库只应保存密文。推荐流程见
+[`docs/key-repository-workflow.md`](docs/key-repository-workflow.md)：
+
+- `scripts/Start-KeyVaultEncrypt.ps1`：本地可见终端加密，密码只在终端输入。
+- `scripts/Publish-KeyVaultToGitHub.ps1`：通过 GitHub API 上传密文，不克隆 `Key` 仓库，并拒绝非私有目标。
+
+如果密码曾经出现在聊天、截图、日志或命令历史里，应把它当作临时密码，正式长期保险库请重新加密换密。
+
 ### 交互式菜单
 
 运行：`python vault_tool.py`（**始终进入菜单**，无论有没有库；菜单按当前状态自适应，

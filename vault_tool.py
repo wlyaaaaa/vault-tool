@@ -44,6 +44,19 @@ from pathlib import Path
 from getpass import getpass
 from datetime import datetime
 
+
+def _configure_stdio():
+    """Prefer UTF-8 output even when imported by tests on a GBK console."""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass
+
+
+_configure_stdio()
+
 # ───────────────────────── 平台检测 ─────────────────────────
 
 _IS_WINDOWS = sys.platform == "win32"
@@ -2177,11 +2190,7 @@ def _parse_args():
 
 if __name__ == "__main__":
     # Windows 控制台可能使用 GBK 编码，emoji 会导致 UnicodeEncodeError
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except (AttributeError, OSError):
-        pass  # Python < 3.7 或非标准流
+    _configure_stdio()
 
     args = _parse_args()
     _NO_COLOR_FLAG = args.no_color
