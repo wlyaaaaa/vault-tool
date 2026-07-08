@@ -11,6 +11,7 @@ import struct
 import secrets
 import tarfile
 import io
+import json
 import tempfile
 import shutil
 import contextlib
@@ -504,6 +505,78 @@ class TestVaultVersionV3(unittest.TestCase):
     def test_flags_none_for_v2(self):
         self.f.write_bytes(vault_tool._pack_vault("pw", b"x"))
         self.assertIsNone(vault_tool.vault_flags(self.f))
+
+
+class TestJsonMetadataCli(unittest.TestCase):
+    """AI-safe JSON metadata commands."""
+
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp())
+        self._orig = {k: getattr(vault_tool, k) for k in (
+            "BASE", "SOURCE_DIR", "DECRYPTED_DIR", "VAULT_FILE", "LOG_FILE")}
+        vault_tool.BASE = self.tmpdir
+        vault_tool.SOURCE_DIR = self.tmpdir / "source"
+        vault_tool.DECRYPTED_DIR = self.tmpdir / "decrypted"
+        vault_tool.VAULT_FILE = self.tmpdir / "vault.enc"
+        vault_tool.LOG_FILE = self.tmpdir / "vault.log"
+
+    def tearDown(self):
+        for k, v in self._orig.items():
+            setattr(vault_tool, k, v)
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def run_json(self, *args):
+        self.assertTrue(hasattr(vault_tool, "main"),
+                        "vault_tool.main() should expose JSON CLI commands")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            vault_tool.main(list(args))
+        return json.loads(out.getvalue())
+
+    def assert_ai_safe(self, data):
+        text = json.dumps(data, ensure_ascii=False).lower()
+        self.assertNotIn("password", text)
+        self.assertNotIn("plaintext", text)
+        self.assertNotIn("keyfile_hash", text)
+        self.assertNotIn("keyfile_bytes", text)
+
+    def test_info_json_reports_vault03_metadata_without_secrets(self):
+        vault_tool.VAULT_FILE.write_bytes(
+            vault_tool._pack_vault_v3("pw", b"metadata only", kdf=(1, 2, 1, 1)))
+
+        data = self.run_json("info", "--json")
+
+        self.assertTrue(data["ok"])
+        self.assertTrue(data["exists"])
+        self.assertEqual(data["vault_format"], "VAULT03")
+        self.assertIn(data["kdf"], ("scrypt", "argon2id"))
+        self.assertEqual(data["kdf_params"], {"n": 2, "r": 1, "p": 1})
+        self.assertFalse(data["keyfile_required"])
+        self.assertTrue(data["compressed"])
+        self.assert_ai_safe(data)
+
+    def test_doctor_json_reports_environment_without_reading_plaintext(self):
+        vault_tool.SOURCE_DIR.mkdir()
+        vault_tool.DECRYPTED_DIR.mkdir()
+        (vault_tool.DECRYPTED_DIR / "password.txt").write_text(
+            "do not leak this plaintext", encoding="utf-8")
+        vault_tool.LOG_FILE.write_text("metadata log only", encoding="utf-8")
+
+        data = self.run_json("doctor", "--json")
+
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["base"], str(self.tmpdir))
+        self.assertEqual(data["vault_file"], str(vault_tool.VAULT_FILE))
+        self.assertTrue(data["source_exists"])
+        self.assertTrue(data["decrypted_exists"])
+        self.assertTrue(data["vault_log_exists"])
+        self.assertEqual(data["is_old_default_path"],
+                         str(self.tmpdir).lower() == "e:\\vault")
+        self.assertEqual(data["platform"], sys.platform)
+        self.assertIsInstance(data["has_cryptography"], bool)
+        self.assertIsInstance(data["has_argon2"], bool)
+        self.assertEqual(data["messages"], [])
+        self.assert_ai_safe(data)
 
 
 class TestSecureZero(unittest.TestCase):

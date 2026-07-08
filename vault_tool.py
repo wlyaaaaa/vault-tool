@@ -40,6 +40,7 @@ import logging
 import threading
 import subprocess
 import gc
+import json
 from pathlib import Path
 from getpass import getpass
 from datetime import datetime
@@ -1057,6 +1058,120 @@ def vault_flags(path):
     if head[:7] == MAGIC_V3 and len(head) >= 8:
         return head[7]
     return None
+
+
+def _kdf_metadata(kdf_id, a, b, c):
+    if kdf_id == 1:
+        return "scrypt", {"n": a, "r": b, "p": c}
+    if kdf_id == 2:
+        return "argon2id", {"time_cost": a, "memory_cost_kib": b, "parallelism": c}
+    return "unknown", {"id": kdf_id, "a": a, "b": b, "c": c}
+
+
+def collect_vault_info(path=None):
+    """Return AI-safe vault metadata without reading or decrypting plaintext."""
+    path = Path(VAULT_FILE if path is None else path)
+    info = {
+        "ok": False,
+        "vault_file": str(path),
+        "exists": path.exists(),
+    }
+    if not path.exists():
+        info["message"] = "vault file not found"
+        return info
+
+    stat = path.stat()
+    info["size"] = stat.st_size
+
+    try:
+        with open(path, "rb") as fh:
+            magic = fh.read(7)
+            if magic == MAGIC_V3:
+                flags_data = fh.read(1)
+                kdf_data = fh.read(13)
+                if len(flags_data) != 1 or len(kdf_data) != 13:
+                    raise ValueError("truncated VAULT03 header")
+                flags = flags_data[0]
+                kdf_id, a, b, c = struct.unpack(">BIII", kdf_data)
+                kdf, kdf_params = _kdf_metadata(kdf_id, a, b, c)
+                return {
+                    **info,
+                    "ok": True,
+                    "vault_format": "VAULT03",
+                    "kdf": kdf,
+                    "kdf_params": kdf_params,
+                    "keyfile_required": bool(flags & FLAG_KEYFILE),
+                    "compressed": bool(flags & FLAG_COMPRESSED),
+                }
+
+            if magic == MAGIC_V2:
+                kdf_data = fh.read(13)
+                if len(kdf_data) != 13:
+                    raise ValueError("truncated VAULT02 header")
+                kdf_id, a, b, c = struct.unpack(">BIII", kdf_data)
+                kdf, kdf_params = _kdf_metadata(kdf_id, a, b, c)
+                return {
+                    **info,
+                    "ok": True,
+                    "vault_format": "VAULT02",
+                    "kdf": kdf,
+                    "kdf_params": kdf_params,
+                    "keyfile_required": False,
+                    "compressed": False,
+                }
+
+            if magic == MAGIC_V1:
+                return {
+                    **info,
+                    "ok": True,
+                    "vault_format": "VAULT01",
+                    "kdf": "pbkdf2",
+                    "kdf_params": {},
+                    "keyfile_required": False,
+                    "compressed": False,
+                }
+
+            return {
+                **info,
+                "vault_format": "unknown",
+                "message": "vault format not recognized",
+            }
+    except (OSError, ValueError, struct.error):
+        return {
+            **info,
+            "vault_format": "unknown",
+            "message": "vault header could not be parsed",
+        }
+
+
+def collect_doctor_info(base=None):
+    """Return AI-safe environment metadata without reading plaintext files."""
+    if base is None:
+        base_path = BASE
+        source_dir = SOURCE_DIR
+        decrypted_dir = DECRYPTED_DIR
+        vault_file = VAULT_FILE
+        log_file = LOG_FILE
+    else:
+        base_path = Path(base)
+        source_dir = base_path / "source"
+        decrypted_dir = base_path / "decrypted"
+        vault_file = base_path / "vault.enc"
+        log_file = base_path / "vault.log"
+
+    return {
+        "ok": True,
+        "base": str(base_path),
+        "vault_file": str(vault_file),
+        "source_exists": source_dir.exists(),
+        "decrypted_exists": decrypted_dir.exists(),
+        "vault_log_exists": log_file.exists(),
+        "is_old_default_path": str(base_path).rstrip("\\/").lower() == "e:\\vault",
+        "platform": sys.platform,
+        "has_cryptography": _HAS_CRYPTOGRAPHY,
+        "has_argon2": _HAS_ARGON2,
+        "messages": [],
+    }
 
 
 # ───────────────────── tar 安全处理 ─────────────────────
@@ -2144,7 +2259,7 @@ def _menu_loop():
 
 # ───────────────────────── CLI 参数 ─────────────────────────
 
-def _parse_args():
+def _parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Vault 保险库 — 本地加密工具",
         epilog="不带子命令运行则进入交互菜单。",
@@ -2167,7 +2282,11 @@ def _parse_args():
     mig = sub.add_parser("migrate", help="升级旧版 → VAULT03")
     mig.add_argument("--keyfile", help="升级时绑定密钥文件")
 
-    sub.add_parser("info", help="查看库信息（不需要密码）")
+    info = sub.add_parser("info", help="查看库信息（不需要密码）")
+    info.add_argument("--json", action="store_true", help="输出 AI-safe JSON 元数据")
+
+    doctor = sub.add_parser("doctor", help="检查本地 vault-tool 环境")
+    doctor.add_argument("--json", action="store_true", help="输出 AI-safe JSON 元数据")
 
     pw = sub.add_parser("passwd", help="修改密码 / 密钥文件")
     pw.add_argument("--keyfile", help="当前密钥文件（若库需要）")
@@ -2183,22 +2302,45 @@ def _parse_args():
     unhide.add_argument("--in", dest="infile", required=True, help="隐写图片路径")
     unhide.add_argument("--out", help="还原输出路径")
 
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 # ───────────────────────── 入口 ─────────────────────────
 
-if __name__ == "__main__":
+def _print_json(data):
+    print(json.dumps(data, ensure_ascii=False))
+
+
+def _print_doctor_info(data):
+    _init_colors()
+    _banner("🩺 环境检查")
+    print(f"\n  根目录：{data['base']}")
+    print(f"  保险库：{data['vault_file']}")
+    print(f"  source/：{'存在' if data['source_exists'] else '不存在'}")
+    print(f"  decrypted/：{'存在' if data['decrypted_exists'] else '不存在'}")
+    print(f"  vault.log：{'存在' if data['vault_log_exists'] else '不存在'}")
+    print(f"  平台：{data['platform']}")
+    print(f"  cryptography：{'可用' if data['has_cryptography'] else '不可用/不需要'}")
+    print(f"  argon2-cffi：{'可用' if data['has_argon2'] else '不可用'}")
+
+
+def main(argv=None):
     # Windows 控制台可能使用 GBK 编码，emoji 会导致 UnicodeEncodeError
     _configure_stdio()
 
-    args = _parse_args()
+    args = _parse_args(argv)
+    json_mode = (
+        (args.command == "info" and getattr(args, "json", False))
+        or (args.command == "doctor" and getattr(args, "json", False))
+    )
+    global _NO_COLOR_FLAG
     _NO_COLOR_FLAG = args.no_color
     _init_colors()
 
-    print()
-    _setup_logging()
-    _cleanup_stale_plaintext()
+    if not json_mode:
+        print()
+        _setup_logging()
+        _cleanup_stale_plaintext()
 
     if args.command:
       # CLI 模式：单次执行；密码锁定 / 中断转为干净的退出码
@@ -2211,7 +2353,16 @@ if __name__ == "__main__":
         elif args.command == "migrate":
             migrate_mode(keyfile_path=args.keyfile)
         elif args.command == "info":
-            vault_info()
+            if args.json:
+                _print_json(collect_vault_info(VAULT_FILE))
+            else:
+                vault_info()
+        elif args.command == "doctor":
+            data = collect_doctor_info()
+            if args.json:
+                _print_json(data)
+            else:
+                _print_doctor_info(data)
         elif args.command == "passwd":
             change_password_mode(keyfile_path=args.keyfile)
         elif args.command == "decoy":
@@ -2241,4 +2392,10 @@ if __name__ == "__main__":
     else:
         # 持久交互菜单：除了 [0] 或强制退出，程序不主动退出
         _menu_loop()
-    print()
+    if not json_mode:
+        print()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
