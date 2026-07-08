@@ -49,6 +49,7 @@
 `vault-tool` 是公开工具仓库，`Key` 仓库只应保存密文。推荐流程见
 [`docs/key-repository-workflow.md`](docs/key-repository-workflow.md)：
 
+- 当前维护目录：`E:\Projects\Tools\vault-tool`
 - `scripts/Start-KeyVaultEncrypt.ps1`：本地可见终端加密，密码只在终端输入。
 - `scripts/Publish-KeyVaultToGitHub.ps1`：通过 GitHub API 上传密文，不克隆 `Key` 仓库，并拒绝非私有目标。
 

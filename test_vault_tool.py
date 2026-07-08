@@ -558,6 +558,8 @@ class TestJsonMetadataCli(unittest.TestCase):
     def test_doctor_json_reports_environment_without_reading_plaintext(self):
         vault_tool.SOURCE_DIR.mkdir()
         vault_tool.DECRYPTED_DIR.mkdir()
+        (vault_tool.SOURCE_DIR / "production-api-token.txt").write_text(
+            "do not leak this source filename or content", encoding="utf-8")
         (vault_tool.DECRYPTED_DIR / "password.txt").write_text(
             "do not leak this plaintext", encoding="utf-8")
         vault_tool.LOG_FILE.write_text("metadata log only", encoding="utf-8")
@@ -577,6 +579,10 @@ class TestJsonMetadataCli(unittest.TestCase):
         self.assertIsInstance(data["has_argon2"], bool)
         self.assertEqual(data["messages"], [])
         self.assert_ai_safe(data)
+        self.assertTrue((vault_tool.DECRYPTED_DIR / "password.txt").exists())
+        text = json.dumps(data, ensure_ascii=False).lower()
+        self.assertNotIn("production-api-token.txt", text)
+        self.assertNotIn("do not leak this source filename or content", text)
 
 
 class TestSecureZero(unittest.TestCase):
