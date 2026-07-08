@@ -19,7 +19,7 @@
    请使用足够长的口令（建议 6+ 随机单词，或 16+ 位随机串）。
 """
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 import os
 import sys
@@ -1174,6 +1174,203 @@ def collect_doctor_info(base=None):
     }
 
 
+def _ai_safe_contract(mode):
+    return {
+        "ok": True,
+        "mode": mode,
+        "safe_for_ai": True,
+        "password_seen_by_ai": False,
+        "plaintext_read": False,
+        "plaintext_written": False,
+        "decryption_attempted": False,
+    }
+
+
+def _risk(code, severity, message):
+    return {"code": code, "severity": severity, "message": message}
+
+
+def _action(action, reason, requires_password=False):
+    return {
+        "action": action,
+        "reason": reason,
+        "requires_password": bool(requires_password),
+    }
+
+
+def collect_vault_assessment(base=None):
+    """Return AI-safe vault risk assessment without decrypting or listing files."""
+    if base is None:
+        base_path = BASE
+        vault_path = VAULT_FILE
+    else:
+        base_path = Path(base)
+        vault_path = base_path / "vault.enc"
+
+    vault = collect_vault_info(vault_path)
+    environment = collect_doctor_info(base_path)
+    risks = []
+    actions = []
+
+    vault_exists = bool(vault.get("exists"))
+    vault_format = vault.get("vault_format")
+    source_exists = bool(environment.get("source_exists"))
+    decrypted_exists = bool(environment.get("decrypted_exists"))
+
+    if environment.get("is_old_default_path"):
+        risks.append(_risk(
+            "old_default_path",
+            "critical",
+            "The base path is the deprecated E:\\Vault location.",
+        ))
+        actions.append(_action(
+            "move_vault_root",
+            "Use the maintained vault-tool directory before operating.",
+        ))
+
+    if decrypted_exists:
+        risks.append(_risk(
+            "stale_decrypted_dir",
+            "warning",
+            "A decrypted/ directory exists; clean it before other work.",
+        ))
+        actions.append(_action(
+            "clean_decrypted",
+            "Remove stale decrypted output before continuing.",
+        ))
+
+    if not vault_exists:
+        risks.append(_risk(
+            "vault_missing",
+            "info",
+            "No vault.enc exists in the current vault-tool directory.",
+        ))
+        if source_exists:
+            risks.append(_risk(
+                "source_ready",
+                "info",
+                "source/ exists; local encryption may be the next action.",
+            ))
+            actions.append(_action(
+                "encrypt",
+                "source/ exists and can be encrypted locally.",
+                requires_password=True,
+            ))
+        else:
+            actions.append(_action(
+                "create_source",
+                "Create source/ and add files before encryption.",
+            ))
+    elif vault_format in ("VAULT01", "VAULT02"):
+        risks.append(_risk(
+            "legacy_vault_format",
+            "warning",
+            f"{vault_format} is readable but should be migrated to VAULT03.",
+        ))
+        actions.append(_action(
+            "migrate",
+            "Upgrade the legacy vault to VAULT03.",
+            requires_password=True,
+        ))
+    elif vault_format == "VAULT03":
+        if not vault.get("keyfile_required"):
+            risks.append(_risk(
+                "keyfile_not_required",
+                "warning",
+                "The VAULT03 file is password-only; consider adding a keyfile for higher assurance.",
+            ))
+            actions.append(_action(
+                "consider_keyfile",
+                "Re-encrypt or change credentials with a keyfile if the vault protects high-value secrets.",
+                requires_password=True,
+            ))
+        actions.append(_action(
+            "inspect_or_decrypt",
+            "A modern vault exists; inspect metadata or decrypt locally only when needed.",
+            requires_password=True,
+        ))
+    else:
+        risks.append(_risk(
+            "unknown_vault_format",
+            "critical",
+            "The vault header is unknown or malformed; manual review is required.",
+        ))
+        actions.append(_action(
+            "manual_review",
+            "Do not attempt automated operations until the vault file is reviewed.",
+        ))
+
+    if source_exists and vault_exists:
+        risks.append(_risk(
+            "source_ready",
+            "info",
+            "source/ exists; new local encryption or merge may be appropriate.",
+        ))
+        actions.append(_action(
+            "encrypt",
+            "source/ exists and can be merged or encrypted locally.",
+            requires_password=True,
+        ))
+    elif source_exists and not any(a["action"] == "encrypt" for a in actions):
+        risks.append(_risk(
+            "source_ready",
+            "info",
+            "source/ exists; local encryption may be the next action.",
+        ))
+        actions.append(_action(
+            "encrypt",
+            "source/ exists and can be encrypted locally.",
+            requires_password=True,
+        ))
+
+    if not environment.get("has_argon2"):
+        risks.append(_risk(
+            "argon2_unavailable",
+            "info",
+            "Argon2id support is unavailable; scrypt remains usable without third-party dependencies.",
+        ))
+
+    return {
+        **_ai_safe_contract("assess"),
+        "vault": vault,
+        "environment": environment,
+        "risks": risks,
+        "recommended_actions": actions,
+    }
+
+
+def collect_vault_plan(base=None):
+    """Return one deterministic next-action plan from AI-safe assessment metadata."""
+    assessment = collect_vault_assessment(base)
+    risk_codes = {risk["code"] for risk in assessment["risks"]}
+    action_map = {action["action"]: action for action in assessment["recommended_actions"]}
+
+    if "unknown_vault_format" in risk_codes or "old_default_path" in risk_codes:
+        decision = "manual_review"
+    elif "stale_decrypted_dir" in risk_codes:
+        decision = "clean_decrypted"
+    elif "legacy_vault_format" in risk_codes:
+        decision = "migrate"
+    elif "source_ready" in risk_codes:
+        decision = "encrypt"
+    elif assessment["vault"].get("exists") and assessment["vault"].get("ok"):
+        decision = "inspect_or_decrypt"
+    else:
+        decision = "create_source"
+
+    chosen = action_map.get(decision)
+    if chosen is None:
+        chosen = _action(decision, "Follow the selected assessment decision.")
+
+    return {
+        **_ai_safe_contract("plan"),
+        "decision": decision,
+        "reason": chosen["reason"],
+        "requires_password": bool(chosen["requires_password"]),
+        "assessment": assessment,
+    }
+
+
 # ───────────────────── tar 安全处理 ─────────────────────
 
 def _tar_total_size(tar):
@@ -2288,6 +2485,12 @@ def _parse_args(argv=None):
     doctor = sub.add_parser("doctor", help="检查本地 vault-tool 环境")
     doctor.add_argument("--json", action="store_true", help="输出 AI-safe JSON 元数据")
 
+    assess = sub.add_parser("assess", help="AI-safe 风险评估（不解密）")
+    assess.add_argument("--json", action="store_true", help="输出 AI-safe JSON 元数据")
+
+    plan = sub.add_parser("plan", help="AI-safe 下一步计划（不执行）")
+    plan.add_argument("--json", action="store_true", help="输出 AI-safe JSON 元数据")
+
     pw = sub.add_parser("passwd", help="修改密码 / 密钥文件")
     pw.add_argument("--keyfile", help="当前密钥文件（若库需要）")
 
@@ -2324,6 +2527,25 @@ def _print_doctor_info(data):
     print(f"  argon2-cffi：{'可用' if data['has_argon2'] else '不可用'}")
 
 
+def _print_assessment(data):
+    _init_colors()
+    _banner("🧭 AI-safe 风险评估")
+    print(f"\n  保险库：{data['vault'].get('vault_file')}")
+    print(f"  格式：{data['vault'].get('vault_format', 'missing')}")
+    print(f"  风险数：{len(data['risks'])}")
+    for item in data["risks"]:
+        print(f"  - [{item['severity']}] {item['code']}: {item['message']}")
+    print(f"  推荐动作：{', '.join(a['action'] for a in data['recommended_actions']) or '无'}")
+
+
+def _print_plan(data):
+    _init_colors()
+    _banner("🧭 AI-safe 下一步计划")
+    print(f"\n  决策：{data['decision']}")
+    print(f"  原因：{data['reason']}")
+    print(f"  需要本地密码：{'是' if data['requires_password'] else '否'}")
+
+
 def main(argv=None):
     # Windows 控制台可能使用 GBK 编码，emoji 会导致 UnicodeEncodeError
     _configure_stdio()
@@ -2332,6 +2554,8 @@ def main(argv=None):
     json_mode = (
         (args.command == "info" and getattr(args, "json", False))
         or (args.command == "doctor" and getattr(args, "json", False))
+        or (args.command == "assess" and getattr(args, "json", False))
+        or (args.command == "plan" and getattr(args, "json", False))
     )
     global _NO_COLOR_FLAG
     _NO_COLOR_FLAG = args.no_color
@@ -2363,6 +2587,18 @@ def main(argv=None):
                 _print_json(data)
             else:
                 _print_doctor_info(data)
+        elif args.command == "assess":
+            data = collect_vault_assessment()
+            if args.json:
+                _print_json(data)
+            else:
+                _print_assessment(data)
+        elif args.command == "plan":
+            data = collect_vault_plan()
+            if args.json:
+                _print_json(data)
+            else:
+                _print_plan(data)
         elif args.command == "passwd":
             change_password_mode(keyfile_path=args.keyfile)
         elif args.command == "decoy":

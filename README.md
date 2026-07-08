@@ -1,4 +1,4 @@
-# Vault v2.1.0 — 本地加密保险库
+# Vault v2.2.0 — 本地加密保险库
 
 纯 Python 离线加密工具。Windows 下**零第三方依赖**（仅标准库 + 内置 `bcrypt.dll`）；Linux / macOS 需 `pip install cryptography`。
 
@@ -12,6 +12,7 @@
 - 隐藏存在：**隐写术**——把 `vault.enc` 藏进一张正常图片
 - 抗量子：AES-256 对量子 Grover 算法仍有等效 128 位强度，足够安全
 - 持久菜单：除 `[0]` 或强制退出外不会主动退出
+- AI 控制面：`info/doctor/assess/plan --json` 只读输出元数据、风险和下一步建议，方便 AI 安全调用
 - 支持任意文件类型、含子目录；仍兼容解密旧版 `VAULT02` / `VAULT01`
 
 ---
@@ -113,6 +114,10 @@ python vault_tool.py decrypt --no-disk           # 不落盘安全查看
 python vault_tool.py decrypt --extract           # 解压到 decrypted/
 python vault_tool.py decrypt --keyfile cat.jpg   # 提供密钥文件
 python vault_tool.py info                         # 查看库信息（不需要密码）
+python vault_tool.py info --json                  # 输出 AI-safe 库元数据（不解密）
+python vault_tool.py doctor --json                # 输出 AI-safe 本地环境元数据
+python vault_tool.py assess --json                # 输出 AI-safe 风险评估与推荐动作
+python vault_tool.py plan --json                  # 输出 AI-safe 下一步计划（只建议，不执行）
 python vault_tool.py passwd                       # 修改密码 / 密钥文件
 python vault_tool.py migrate                      # 升级旧版 → VAULT03
 python vault_tool.py decoy                        # 设置诱饵密码
@@ -120,6 +125,11 @@ python vault_tool.py hide   --cover photo.jpg --out album.jpg   # 藏入图片
 python vault_tool.py unhide --in album.jpg --out vault.enc      # 从图片提取
 python vault_tool.py --no-color ...               # 禁用彩色输出
 ```
+
+`info/doctor/assess/plan --json` 是给 AI 和自动化使用的**只读控制面**：不接收密码、
+不尝试解密、不读取明文内容、不列出 `source/` 或 `decrypted/` 里的文件名，只返回格式、
+KDF、依赖、残留目录、风险码和推荐动作等元数据。真正的加密、解密、迁移和改密仍然必须由
+人在本地终端输入密码后执行。
 
 ---
 

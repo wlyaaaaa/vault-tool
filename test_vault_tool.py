@@ -535,10 +535,17 @@ class TestJsonMetadataCli(unittest.TestCase):
 
     def assert_ai_safe(self, data):
         text = json.dumps(data, ensure_ascii=False).lower()
-        self.assertNotIn("password", text)
-        self.assertNotIn("plaintext", text)
+        if "password_seen_by_ai" in data:
+            self.assertFalse(data["password_seen_by_ai"])
+        if "plaintext_read" in data:
+            self.assertFalse(data["plaintext_read"])
+        if "plaintext_written" in data:
+            self.assertFalse(data["plaintext_written"])
         self.assertNotIn("keyfile_hash", text)
         self.assertNotIn("keyfile_bytes", text)
+        self.assertNotIn("do not leak", text)
+        self.assertNotIn("marker-source-secret", text)
+        self.assertNotIn("marker-decrypted-secret", text)
 
     def test_info_json_reports_vault03_metadata_without_secrets(self):
         vault_tool.VAULT_FILE.write_bytes(
@@ -583,6 +590,50 @@ class TestJsonMetadataCli(unittest.TestCase):
         text = json.dumps(data, ensure_ascii=False).lower()
         self.assertNotIn("production-api-token.txt", text)
         self.assertNotIn("do not leak this source filename or content", text)
+
+    def test_assess_json_reports_safe_contract_and_missing_vault(self):
+        data = self.run_json("assess", "--json")
+
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["mode"], "assess")
+        self.assertTrue(data["safe_for_ai"])
+        self.assertFalse(data["password_seen_by_ai"])
+        self.assertFalse(data["plaintext_read"])
+        self.assertFalse(data["plaintext_written"])
+        self.assertFalse(data["decryption_attempted"])
+        self.assertIn("vault_missing", {r["code"] for r in data["risks"]})
+        self.assertIn("create_source", {a["action"] for a in data["recommended_actions"]})
+        self.assert_ai_safe(data)
+
+    def test_assess_json_does_not_leak_source_or_decrypted_filenames(self):
+        vault_tool.SOURCE_DIR.mkdir()
+        vault_tool.DECRYPTED_DIR.mkdir()
+        (vault_tool.SOURCE_DIR / "production-api-token.txt").write_text(
+            "marker-source-secret", encoding="utf-8")
+        (vault_tool.DECRYPTED_DIR / "recovery-note.txt").write_text(
+            "marker-decrypted-secret", encoding="utf-8")
+
+        data = self.run_json("assess", "--json")
+
+        text = json.dumps(data, ensure_ascii=False)
+        self.assertNotIn("production-api-token", text)
+        self.assertNotIn("recovery-note.txt", text)
+        self.assertNotIn("marker-source-secret", text)
+        self.assertNotIn("marker-decrypted-secret", text)
+        self.assertIn("source_ready", {r["code"] for r in data["risks"]})
+        self.assertIn("stale_decrypted_dir", {r["code"] for r in data["risks"]})
+        self.assert_ai_safe(data)
+
+    def test_plan_json_recommends_migrate_for_vault02(self):
+        vault_tool.VAULT_FILE.write_bytes(vault_tool._pack_vault("pw", b"legacy"))
+
+        data = self.run_json("plan", "--json")
+
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["mode"], "plan")
+        self.assertEqual(data["decision"], "migrate")
+        self.assertTrue(data["requires_password"])
+        self.assert_ai_safe(data)
 
 
 class TestSecureZero(unittest.TestCase):
