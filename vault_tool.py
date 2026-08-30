@@ -22,6 +22,7 @@
 __version__ = "2.2.0"
 
 import os
+import stat
 import sys
 import math
 import hashlib
@@ -686,32 +687,119 @@ def _clear_clipboard_later(seconds):
 
 # ───────────────────────── 安全删除 ─────────────────────────
 
-def secure_delete(filepath):
+def _is_reparse_point(file_stat):
+    flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(flag and (getattr(file_stat, "st_file_attributes", 0) & flag))
+
+
+def _validate_secure_delete_file(filepath):
+    filepath = Path(filepath)
+    file_stat = filepath.lstat()
+    if stat.S_ISLNK(file_stat.st_mode) or _is_reparse_point(file_stat):
+        raise ValueError(f"拒绝安全删除链接或重解析点: {filepath}")
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise ValueError(f"安全删除只接受普通文件: {filepath}")
+    if file_stat.st_nlink != 1:
+        raise ValueError(f"拒绝安全删除具有多个硬链接的文件: {filepath}")
+    return file_stat
+
+
+def _validate_secure_delete_dir(dirpath):
+    dirpath = Path(dirpath)
+    dir_stat = dirpath.lstat()
+    if stat.S_ISLNK(dir_stat.st_mode) or _is_reparse_point(dir_stat):
+        raise ValueError(f"拒绝安全删除链接或重解析目录: {dirpath}")
+    if not stat.S_ISDIR(dir_stat.st_mode):
+        raise ValueError(f"安全删除目录需要普通目录: {dirpath}")
+    return dir_stat
+
+
+def _secure_file_identity(file_stat):
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        file_stat.st_mode,
+        file_stat.st_nlink,
+        file_stat.st_size,
+    )
+
+
+def _preflight_secure_delete_dir(dirpath):
+    root = Path(dirpath)
+    try:
+        root_stat = _validate_secure_delete_dir(root)
+    except FileNotFoundError:
+        return None
+    root_resolved = root.resolve(strict=True)
+    root_key = os.path.normcase(str(root_resolved))
+    files = []
+    directories = [(root, (root_stat.st_dev, root_stat.st_ino))]
+
+    def visit(current):
+        with os.scandir(current) as entries:
+            for entry in sorted(entries, key=lambda item: item.name):
+                path = Path(entry.path)
+                path_stat = path.lstat()
+                if stat.S_ISLNK(path_stat.st_mode) or _is_reparse_point(path_stat):
+                    raise ValueError(f"拒绝安全删除包含链接或重解析点的目录: {path}")
+                resolved_key = os.path.normcase(str(path.resolve(strict=True)))
+                try:
+                    contained = os.path.commonpath((root_key, resolved_key)) == root_key
+                except ValueError:
+                    contained = False
+                if not contained:
+                    raise ValueError(f"安全删除路径越出目标目录: {path}")
+                if stat.S_ISDIR(path_stat.st_mode):
+                    directories.append((path, (path_stat.st_dev, path_stat.st_ino)))
+                    visit(path)
+                elif stat.S_ISREG(path_stat.st_mode):
+                    if path_stat.st_nlink != 1:
+                        raise ValueError(f"拒绝安全删除具有多个硬链接的文件: {path}")
+                    files.append((path, _secure_file_identity(path_stat)))
+                else:
+                    raise ValueError(f"安全删除目录包含非普通文件: {path}")
+
+    visit(root)
+    return files, directories
+
+
+def secure_delete(filepath, _expected_identity=None):
     """覆写一遍随机数据后删除。
     注意：在 SSD 上由于磨损均衡/TRIM，覆写不保证抹掉原始数据，
     真正可靠的做法是"明文尽量不落盘"。机械硬盘上一遍随机即足够。"""
     filepath = Path(filepath)
-    if not filepath.exists():
-        return
-    size = filepath.stat().st_size
     try:
-        with open(filepath, "r+b", buffering=0) as fh:
-            fh.write(secrets.token_bytes(max(size, 512)))
-            fh.flush()
-            os.fsync(fh.fileno())
-    except OSError:
-        pass
+        file_stat = _validate_secure_delete_file(filepath)
+    except FileNotFoundError:
+        if _expected_identity is not None:
+            raise
+        return
+    identity = _secure_file_identity(file_stat)
+    if _expected_identity is not None and identity != _expected_identity:
+        raise RuntimeError(f"安全删除文件在预检后发生变化: {filepath}")
+    with open(filepath, "r+b", buffering=0) as fh:
+        opened_stat = os.fstat(fh.fileno())
+        if _secure_file_identity(opened_stat) != identity:
+            raise RuntimeError(f"安全删除打开的文件与预检对象不一致: {filepath}")
+        fh.write(secrets.token_bytes(max(file_stat.st_size, 512)))
+        fh.flush()
+        os.fsync(fh.fileno())
     filepath.unlink()
 
 
 def secure_delete_dir(dirpath):
     dirpath = Path(dirpath)
-    if not dirpath.exists():
+    preflight = _preflight_secure_delete_dir(dirpath)
+    if preflight is None:
         return
-    for f in sorted(dirpath.rglob("*"), key=lambda p: len(str(p)), reverse=True):
-        if f.is_file():
-            secure_delete(f)
-    shutil.rmtree(dirpath, ignore_errors=True)
+    files, directories = preflight
+    for filepath, identity in files:
+        secure_delete(filepath, _expected_identity=identity)
+    for directory, identity in reversed(directories):
+        current_stat = _validate_secure_delete_dir(directory)
+        if (current_stat.st_dev, current_stat.st_ino) != identity:
+            raise RuntimeError(f"安全删除目录在预检后发生变化: {directory}")
+        directory.rmdir()
 
 
 # ───────────────────── AES-256-GCM / AES-256-CBC ─────────────────────

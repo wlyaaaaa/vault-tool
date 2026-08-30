@@ -186,6 +186,55 @@ class TestSecureDelete(unittest.TestCase):
         vault_tool.secure_delete_dir(d)
         self.assertFalse(d.exists())
 
+    def test_dir_rejects_hardlink_before_overwriting_any_file(self):
+        outside = self.tmpdir / "outside-user-file.txt"
+        outside.write_bytes(b"outside bytes must remain unchanged")
+        d = self.tmpdir / "source"
+        d.mkdir()
+        ordinary = d / "a-ordinary.txt"
+        ordinary.write_bytes(b"ordinary bytes must remain unchanged")
+        linked = d / "z-linked.txt"
+        os.link(outside, linked)
+        outside_before = outside.read_bytes()
+        ordinary_before = ordinary.read_bytes()
+
+        with self.assertRaises(ValueError):
+            vault_tool.secure_delete_dir(d)
+
+        self.assertEqual(outside.read_bytes(), outside_before)
+        self.assertEqual(ordinary.read_bytes(), ordinary_before)
+        self.assertTrue(linked.exists())
+
+    def test_file_rejects_hardlink_without_changing_shared_content(self):
+        outside = self.tmpdir / "outside.txt"
+        outside.write_bytes(b"shared bytes")
+        linked = self.tmpdir / "linked.txt"
+        os.link(outside, linked)
+        before = outside.read_bytes()
+
+        with self.assertRaises(ValueError):
+            vault_tool.secure_delete(linked)
+
+        self.assertEqual(outside.read_bytes(), before)
+        self.assertTrue(linked.exists())
+
+    def test_dir_rejects_symlink_when_supported(self):
+        outside = self.tmpdir / "outside.txt"
+        outside.write_bytes(b"outside bytes")
+        d = self.tmpdir / "source"
+        d.mkdir()
+        linked = d / "linked.txt"
+        try:
+            linked.symlink_to(outside)
+        except (NotImplementedError, OSError) as exc:
+            self.skipTest(f"symlink creation unavailable: {exc}")
+
+        with self.assertRaises(ValueError):
+            vault_tool.secure_delete_dir(d)
+
+        self.assertEqual(outside.read_bytes(), b"outside bytes")
+        self.assertTrue(linked.is_symlink())
+
     def test_delete_nonexistent(self):
         """删除不存在的文件不应报错。"""
         vault_tool.secure_delete(self.tmpdir / "no_such_file.txt")
