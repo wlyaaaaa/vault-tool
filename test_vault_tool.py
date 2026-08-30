@@ -150,7 +150,12 @@ class TestVaultVersion(unittest.TestCase):
         self.assertEqual(vault_tool.vault_version(self.test_file), 2)
 
     def test_version_v1(self):
-        self.test_file.write_bytes(b"VAULT01" + b"\x00" * 100)
+        self.test_file.write_bytes(
+            vault_tool.MAGIC_V1
+            + struct.pack(">I", 16) + b"s" * 16
+            + struct.pack(">I", 16) + b"i" * 16
+            + struct.pack(">I", 16) + b"c" * 16
+        )
         self.assertEqual(vault_tool.vault_version(self.test_file), 1)
 
     def test_version_unknown(self):
@@ -610,6 +615,50 @@ class TestJsonMetadataCli(unittest.TestCase):
         self.assertFalse(data["keyfile_required"])
         self.assertTrue(data["compressed"])
         self.assert_ai_safe(data)
+
+    def test_truncated_known_containers_fail_closed_without_reading_ciphertext(self):
+        v1 = (
+            vault_tool.MAGIC_V1
+            + struct.pack(">I", 16) + b"s" * 16
+            + struct.pack(">I", 16) + b"i" * 16
+            + struct.pack(">I", 32) + b"x"
+        )
+        v2 = (
+            vault_tool.MAGIC_V2
+            + struct.pack(">BIII", 1, 2, 1, 1)
+            + struct.pack(">H", 32) + b"s" * 32
+            + struct.pack(">H", 12) + b"n" * 12
+            + b"t" * 16 + struct.pack(">Q", 32) + b"x"
+        )
+        v3 = (
+            vault_tool.MAGIC_V3
+            + bytes([vault_tool.FLAG_COMPRESSED])
+            + struct.pack(">BIII", 1, 2, 1, 1)
+            + struct.pack(">H", 32) + b"s" * 32
+            + struct.pack(">H", 12) + b"n" * 12
+            + b"t" * 16 + struct.pack(">Q", 32) + b"x"
+        )
+
+        for expected_format, blob in (("VAULT01", v1), ("VAULT02", v2), ("VAULT03", v3)):
+            with self.subTest(expected_format=expected_format):
+                vault_tool.VAULT_FILE.write_bytes(blob)
+                info = self.run_json("info", "--json")
+                assessment = self.run_json("assess", "--json")
+
+                self.assertFalse(info["ok"])
+                self.assertFalse(info["structure_valid"])
+                self.assertEqual(expected_format, info["vault_format"])
+                self.assertEqual(0, vault_tool.vault_version(vault_tool.VAULT_FILE))
+                self.assertIn(
+                    "invalid_vault_structure",
+                    {item["code"] for item in assessment["risks"]},
+                )
+                self.assertEqual(
+                    ["manual_review"],
+                    [item["action"] for item in assessment["recommended_actions"]],
+                )
+                self.assert_ai_safe(info)
+                self.assert_ai_safe(assessment)
 
     def test_doctor_json_reports_environment_without_reading_plaintext(self):
         vault_tool.SOURCE_DIR.mkdir()

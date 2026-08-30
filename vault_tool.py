@@ -1123,29 +1123,150 @@ def _decrypt_blob(password, blob, keyfile_hash=None):
     return _unpack_vault(password, blob), 0
 
 
+_MAX_CONTAINER_FIELD_SIZE = 4096
+
+
+def _read_exact(fh, size, label):
+    data = fh.read(size)
+    if len(data) != size:
+        raise ValueError(f"truncated {label}")
+    return data
+
+
+def _read_length(fh, fmt, label):
+    return struct.unpack(fmt, _read_exact(fh, struct.calcsize(fmt), label))[0]
+
+
+def _skip_container_field(fh, file_size, size, label, *, maximum=_MAX_CONTAINER_FIELD_SIZE):
+    if size <= 0 or (maximum is not None and size > maximum):
+        raise ValueError(f"invalid {label} length")
+    end = fh.tell() + size
+    if end > file_size:
+        raise ValueError(f"truncated {label}")
+    fh.seek(size, os.SEEK_CUR)
+
+
+def _validate_container_kdf(kdf_id, a, b, c):
+    """Validate encoded KDF metadata without invoking the KDF runtime."""
+    if min(a, b, c) <= 0:
+        raise ValueError("invalid KDF parameters")
+    if kdf_id == 1:
+        if a < 2 or (a & (a - 1)) != 0 or 128 * a * b > MAX_KDF_MEM:
+            raise ValueError("invalid scrypt parameters")
+    elif kdf_id == 2:
+        if b * 1024 > MAX_KDF_MEM:
+            raise ValueError("invalid Argon2 parameters")
+    else:
+        raise ValueError("unknown KDF id")
+
+
+def _inspect_vault_structure(path):
+    """Read bounded container metadata and validate all declared byte ranges.
+
+    Ciphertext and plaintext are never read.  The returned metadata is safe for
+    version detection and AI-safe assessment, but does not prove authenticity.
+    """
+    path = Path(path)
+    with open(path, "rb") as fh:
+        file_size = os.fstat(fh.fileno()).st_size
+        magic = _read_exact(fh, 7, "vault magic")
+
+        if magic == MAGIC_V3:
+            flags = _read_exact(fh, 1, "VAULT03 flags")[0]
+            kdf_id, a, b, c = struct.unpack(">BIII", _read_exact(fh, 13, "VAULT03 KDF header"))
+            _validate_container_kdf(kdf_id, a, b, c)
+            salt_len = _read_length(fh, ">H", "VAULT03 salt length")
+            _skip_container_field(fh, file_size, salt_len, "VAULT03 salt")
+            nonce_len = _read_length(fh, ">H", "VAULT03 nonce length")
+            _skip_container_field(fh, file_size, nonce_len, "VAULT03 nonce")
+            _read_exact(fh, 16, "VAULT03 authentication tag")
+            ciphertext_len = _read_length(fh, ">Q", "VAULT03 ciphertext length")
+            visible_end = fh.tell() + ciphertext_len
+            if visible_end > file_size:
+                raise ValueError("truncated VAULT03 ciphertext")
+            if file_size != _bucket_size(visible_end):
+                raise ValueError("invalid VAULT03 padded container size")
+            return {
+                "version": 3,
+                "vault_format": "VAULT03",
+                "flags": flags,
+                "kdf_id": kdf_id,
+                "kdf_params_raw": (a, b, c),
+            }
+
+        if magic == MAGIC_V2:
+            kdf_id, a, b, c = struct.unpack(">BIII", _read_exact(fh, 13, "VAULT02 KDF header"))
+            if kdf_id != 1:
+                raise ValueError("unknown VAULT02 KDF id")
+            _validate_container_kdf(kdf_id, a, b, c)
+            salt_len = _read_length(fh, ">H", "VAULT02 salt length")
+            _skip_container_field(fh, file_size, salt_len, "VAULT02 salt")
+            nonce_len = _read_length(fh, ">H", "VAULT02 nonce length")
+            _skip_container_field(fh, file_size, nonce_len, "VAULT02 nonce")
+            _read_exact(fh, 16, "VAULT02 authentication tag")
+            ciphertext_len = _read_length(fh, ">Q", "VAULT02 ciphertext length")
+            if fh.tell() + ciphertext_len != file_size:
+                raise ValueError("truncated or malformed VAULT02 ciphertext")
+            return {
+                "version": 2,
+                "vault_format": "VAULT02",
+                "flags": None,
+                "kdf_id": kdf_id,
+                "kdf_params_raw": (a, b, c),
+            }
+
+        if magic == MAGIC_V1:
+            salt_len = _read_length(fh, ">I", "VAULT01 salt length")
+            _skip_container_field(fh, file_size, salt_len, "VAULT01 salt")
+            iv_len = _read_length(fh, ">I", "VAULT01 IV length")
+            if iv_len != 16:
+                raise ValueError("invalid VAULT01 IV length")
+            _skip_container_field(fh, file_size, iv_len, "VAULT01 IV")
+            ciphertext_len = _read_length(fh, ">I", "VAULT01 ciphertext length")
+            if ciphertext_len <= 0 or ciphertext_len % 16 != 0:
+                raise ValueError("invalid VAULT01 ciphertext length")
+            if fh.tell() + ciphertext_len != file_size:
+                raise ValueError("truncated or malformed VAULT01 ciphertext")
+            return {
+                "version": 1,
+                "vault_format": "VAULT01",
+                "flags": None,
+                "kdf_id": None,
+                "kdf_params_raw": (),
+            }
+
+        raise ValueError("vault format not recognized")
+
+
+def _detected_vault_format(path):
+    try:
+        with open(path, "rb") as fh:
+            magic = fh.read(7)
+    except OSError:
+        return "unknown"
+    return {MAGIC_V1: "VAULT01", MAGIC_V2: "VAULT02", MAGIC_V3: "VAULT03"}.get(
+        magic, "unknown"
+    )
+
+
 def vault_version(path):
     if not path.exists():
         return None
-    with open(path, "rb") as fh:
-        m = fh.read(7)
-    if m == MAGIC_V3:
-        return 3
-    if m == MAGIC_V2:
-        return 2
-    if m == MAGIC_V1:
-        return 1
-    return 0
+    try:
+        return _inspect_vault_structure(path)["version"]
+    except (OSError, ValueError, struct.error):
+        return 0
 
 
 def vault_flags(path):
     """读取 VAULT03 的标志位字节；非 V3 返回 None。"""
     if not path.exists():
         return None
-    with open(path, "rb") as fh:
-        head = fh.read(8)
-    if head[:7] == MAGIC_V3 and len(head) >= 8:
-        return head[7]
-    return None
+    try:
+        metadata = _inspect_vault_structure(path)
+    except (OSError, ValueError, struct.error):
+        return None
+    return metadata["flags"] if metadata["version"] == 3 else None
 
 
 def _kdf_metadata(kdf_id, a, b, c):
@@ -1172,63 +1293,30 @@ def collect_vault_info(path=None):
     info["size"] = stat.st_size
 
     try:
-        with open(path, "rb") as fh:
-            magic = fh.read(7)
-            if magic == MAGIC_V3:
-                flags_data = fh.read(1)
-                kdf_data = fh.read(13)
-                if len(flags_data) != 1 or len(kdf_data) != 13:
-                    raise ValueError("truncated VAULT03 header")
-                flags = flags_data[0]
-                kdf_id, a, b, c = struct.unpack(">BIII", kdf_data)
-                kdf, kdf_params = _kdf_metadata(kdf_id, a, b, c)
-                return {
-                    **info,
-                    "ok": True,
-                    "vault_format": "VAULT03",
-                    "kdf": kdf,
-                    "kdf_params": kdf_params,
-                    "keyfile_required": bool(flags & FLAG_KEYFILE),
-                    "compressed": bool(flags & FLAG_COMPRESSED),
-                }
-
-            if magic == MAGIC_V2:
-                kdf_data = fh.read(13)
-                if len(kdf_data) != 13:
-                    raise ValueError("truncated VAULT02 header")
-                kdf_id, a, b, c = struct.unpack(">BIII", kdf_data)
-                kdf, kdf_params = _kdf_metadata(kdf_id, a, b, c)
-                return {
-                    **info,
-                    "ok": True,
-                    "vault_format": "VAULT02",
-                    "kdf": kdf,
-                    "kdf_params": kdf_params,
-                    "keyfile_required": False,
-                    "compressed": False,
-                }
-
-            if magic == MAGIC_V1:
-                return {
-                    **info,
-                    "ok": True,
-                    "vault_format": "VAULT01",
-                    "kdf": "pbkdf2",
-                    "kdf_params": {},
-                    "keyfile_required": False,
-                    "compressed": False,
-                }
-
-            return {
-                **info,
-                "vault_format": "unknown",
-                "message": "vault format not recognized",
-            }
+        metadata = _inspect_vault_structure(path)
+        version = metadata["version"]
+        if version in (2, 3):
+            a, b, c = metadata["kdf_params_raw"]
+            kdf, kdf_params = _kdf_metadata(metadata["kdf_id"], a, b, c)
+        else:
+            kdf, kdf_params = "pbkdf2", {}
+        flags = metadata["flags"] or 0
+        return {
+            **info,
+            "ok": True,
+            "structure_valid": True,
+            "vault_format": metadata["vault_format"],
+            "kdf": kdf,
+            "kdf_params": kdf_params,
+            "keyfile_required": bool(flags & FLAG_KEYFILE),
+            "compressed": bool(flags & FLAG_COMPRESSED) if version == 3 else False,
+        }
     except (OSError, ValueError, struct.error):
         return {
             **info,
-            "vault_format": "unknown",
-            "message": "vault header could not be parsed",
+            "structure_valid": False,
+            "vault_format": _detected_vault_format(path),
+            "message": "vault container is truncated or malformed",
         }
 
 
@@ -1349,6 +1437,16 @@ def collect_vault_assessment(base=None):
                 "create_source",
                 "Create source/ and add files before encryption.",
             ))
+    elif not vault.get("ok") or not vault.get("structure_valid"):
+        risks.append(_risk(
+            "invalid_vault_structure",
+            "critical",
+            "The vault container is truncated or structurally malformed.",
+        ))
+        actions.append(_action(
+            "manual_review",
+            "Do not decrypt, migrate, or overwrite this vault until its container is recovered.",
+        ))
     elif vault_format in ("VAULT01", "VAULT02"):
         risks.append(_risk(
             "legacy_vault_format",
@@ -1388,7 +1486,7 @@ def collect_vault_assessment(base=None):
             "Do not attempt automated operations until the vault file is reviewed.",
         ))
 
-    if source_exists and vault_exists:
+    if source_exists and vault_exists and vault.get("ok") and vault.get("structure_valid"):
         risks.append(_risk(
             "source_ready",
             "info",
