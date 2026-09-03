@@ -15,6 +15,7 @@ import json
 import tempfile
 import shutil
 import contextlib
+import threading
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -733,6 +734,71 @@ class TestJsonMetadataCli(unittest.TestCase):
         self.assertTrue(data["requires_password"])
         self.assert_ai_safe(data)
 
+    def test_invalid_vault_plan_stays_manual_review_even_with_source(self):
+        vault_tool.VAULT_FILE.write_bytes(vault_tool.MAGIC_V3 + b"\x00")
+        vault_tool.SOURCE_DIR.mkdir()
+        (vault_tool.SOURCE_DIR / "fictional-new.txt").write_text("fixture", encoding="utf-8")
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            exit_code = vault_tool.main(["plan", "--json"])
+        data = json.loads(out.getvalue())
+
+        self.assertEqual(exit_code, 0)  # JSON assessment completed; vault health remains false below.
+        self.assertEqual(data["decision"], "manual_review")
+        self.assertFalse(data["requires_password"])
+        self.assertIn("invalid_vault_structure", {r["code"] for r in data["assessment"]["risks"]})
+        self.assertNotIn("source_ready", {r["code"] for r in data["assessment"]["risks"]})
+        self.assertEqual(["manual_review"], [
+            action["action"] for action in data["assessment"]["recommended_actions"]
+        ])
+
+    def test_visible_cli_errors_return_nonzero_but_json_inspection_stays_structured(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            decrypt_exit = vault_tool.main(["decrypt", "--no-disk"])
+            info_exit = vault_tool.main(["info"])
+            migrate_exit = vault_tool.main(["migrate"])
+            passwd_exit = vault_tool.main(["passwd"])
+            decoy_exit = vault_tool.main(["decoy"])
+        self.assertEqual(decrypt_exit, 1)
+        self.assertEqual(info_exit, 1)
+        self.assertEqual(migrate_exit, 1)
+        self.assertEqual(passwd_exit, 1)
+        self.assertEqual(decoy_exit, 1)
+
+        plain_cover = self.tmpdir / "plain-cover.jpg"
+        plain_cover.write_bytes(b"fixture only")
+        with contextlib.redirect_stdout(io.StringIO()):
+            hide_exit = vault_tool.main([
+                "hide", "--cover", str(self.tmpdir / "missing.jpg"),
+                "--out", str(self.tmpdir / "ignored.jpg"),
+            ])
+            unhide_exit = vault_tool.main([
+                "unhide", "--in", str(plain_cover),
+                "--out", str(self.tmpdir / "ignored.enc"),
+            ])
+        self.assertEqual(hide_exit, 1)
+        self.assertEqual(unhide_exit, 1)
+
+        vault_tool.VAULT_FILE.write_bytes(vault_tool.MAGIC_V3 + b"\x00")
+        data = self.run_json("info", "--json")
+        self.assertFalse(data["ok"])
+
+    def test_requested_argon2_never_silently_downgrades_to_scrypt(self):
+        vault_tool.SOURCE_DIR.mkdir()
+        fixture = vault_tool.SOURCE_DIR / "fixture.txt"
+        fixture.write_text("fixture", encoding="utf-8")
+
+        with mock.patch.object(vault_tool, "_HAS_ARGON2", False), \
+             mock.patch.object(vault_tool, "getpass", side_effect=["pw", "pw"]), \
+             mock.patch("builtins.input", return_value="n"), \
+             contextlib.redirect_stdout(io.StringIO()):
+            exit_code = vault_tool.main(["encrypt", "--kdf", "argon2"])
+
+        self.assertEqual(exit_code, 1)
+        self.assertTrue(fixture.exists())
+        self.assertFalse(vault_tool.VAULT_FILE.exists())
+
 
 class TestSecureZero(unittest.TestCase):
     """memset 快速清零。"""
@@ -879,8 +945,20 @@ class TestAddFilesFlow(_FlowBase):
         solo = self.tmp / "solo.txt"
         solo.write_text("SOLO", encoding="utf-8")
         self.run_with(lambda: vault_tool.add_files_mode(),
-                      ["pw-B", "pw-B"], ["n", str(solo), "", "n"])
+                       ["pw-B", "pw-B"], ["n", str(solo), "", "n"])
         self.assertEqual(self.names_in_vault("pw-B"), {"solo.txt"})
+
+    def test_merge_same_name_keeps_new_source_content(self):
+        self._make_initial("pw-A")
+        self.make_source(**{"old.txt": "NEW"})
+
+        # 合并 Y(回车) → 旧库密码 → 已在 source/ 的新文件不再粘贴路径 → encrypt keyfile n → 新密码×2
+        self.run_with(lambda: vault_tool.add_files_mode(),
+                      ["pw-A", "pw-A", "pw-A"], ["", "", "n"])
+
+        plaintext, _ = vault_tool._decrypt_blob("pw-A", vault_tool.VAULT_FILE.read_bytes())
+        with tarfile.open(fileobj=io.BytesIO(bytes(plaintext)), mode="r") as tar:
+            self.assertEqual(tar.extractfile("old.txt").read(), b"NEW")
 
 
 class TestChangePasswordFlow(_FlowBase):
@@ -916,6 +994,119 @@ class TestDecoyFlow(_FlowBase):
         self.assertIn("real.txt", self.names_in_vault("realpw"))
         self.assertIn("fake.txt", self.names_in_vault("decoypw"))
         self.assertFalse(vault_tool.DECOY_SOURCE_DIR.exists())
+
+
+class TestKdfPreservationFlow(_FlowBase):
+    """Rewrites retain valid source KDFs; only VAULT01 selects current scrypt."""
+
+    @staticmethod
+    def _metadata_kdf():
+        metadata = vault_tool._inspect_vault_structure(vault_tool.VAULT_FILE)
+        return metadata["kdf_id"], *metadata["kdf_params_raw"]
+
+    @staticmethod
+    def _pack_v2_with_kdf(password, plaintext, kdf):
+        kdf_id, n, r, p = kdf
+        salt = b"s" * 32
+        nonce = b"n" * 12
+        key = vault_tool.derive_key_scrypt(password, salt, n=n, r=r, p=p)
+        header = (vault_tool.MAGIC_V2 + struct.pack(">BIII", kdf_id, n, r, p)
+                  + struct.pack(">H", len(salt)) + salt
+                  + struct.pack(">H", len(nonce)) + nonce)
+        ciphertext, tag = vault_tool._aes_gcm("encrypt", key, nonce, plaintext, aad=header)
+        return header + tag + struct.pack(">Q", len(ciphertext)) + ciphertext
+
+    @staticmethod
+    def _nondefault_v3_kdfs():
+        kdfs = [("scrypt", (1, 2, 1, 1))]
+        if vault_tool._HAS_ARGON2:
+            kdfs.append(("argon2id", (2, 1, 8192, 1)))
+        return kdfs
+
+    def test_change_password_preserves_nondefault_v3_kdf_and_content(self):
+        for label, kdf in self._nondefault_v3_kdfs():
+            with self.subTest(kdf=label):
+                vault_tool.VAULT_FILE.write_bytes(
+                    vault_tool._pack_vault_v3("old", b"change fixture", kdf=kdf))
+                self.run_with(lambda: vault_tool.change_password_mode(),
+                              ["old", "new", "new"], ["n"])
+                self.assertEqual(self._metadata_kdf(), kdf)
+                plaintext, _ = vault_tool._decrypt_blob("new", vault_tool.VAULT_FILE.read_bytes())
+                self.assertEqual(bytes(plaintext), b"change fixture")
+
+    def test_decoy_preserves_nondefault_v3_kdf_and_content(self):
+        for label, kdf in self._nondefault_v3_kdfs():
+            with self.subTest(kdf=label):
+                vault_tool.VAULT_FILE.write_bytes(
+                    vault_tool._pack_vault_v3("real", b"real fixture", kdf=kdf))
+                vault_tool.DECOY_SOURCE_DIR.mkdir(parents=True, exist_ok=True)
+                (vault_tool.DECOY_SOURCE_DIR / "decoy.txt").write_text("DECOY", encoding="utf-8")
+                self.run_with(lambda: vault_tool.setup_decoy_mode(),
+                              ["real", "decoy", "decoy"], [])
+                self.assertEqual(self._metadata_kdf(), kdf)
+                real_plaintext, real_layer = vault_tool._decrypt_blob(
+                    "real", vault_tool.VAULT_FILE.read_bytes())
+                decoy_plaintext, decoy_layer = vault_tool._decrypt_blob(
+                    "decoy", vault_tool.VAULT_FILE.read_bytes())
+                self.assertEqual((bytes(real_plaintext), real_layer), (b"real fixture", 1))
+                self.assertEqual(decoy_layer, 0)
+                with tarfile.open(fileobj=io.BytesIO(bytes(decoy_plaintext)), mode="r") as tar:
+                    self.assertEqual(tar.extractfile("decoy.txt").read(), b"DECOY")
+
+    def test_migrate_v2_preserves_encoded_scrypt_parameters(self):
+        kdf = (1, 2, 1, 1)
+        payload = b"v2 fixture"
+        vault_tool.VAULT_FILE.write_bytes(self._pack_v2_with_kdf("pw", payload, kdf))
+
+        self.run_with(lambda: vault_tool.migrate_mode(), ["pw"], ["n"])
+
+        self.assertEqual(self._metadata_kdf(), kdf)
+        plaintext, _ = vault_tool._decrypt_blob("pw", vault_tool.VAULT_FILE.read_bytes())
+        self.assertEqual(bytes(plaintext), payload)
+
+    def test_migrate_v1_explicitly_uses_current_scrypt_target(self):
+        v1 = (vault_tool.MAGIC_V1
+              + struct.pack(">I", 16) + b"s" * 16
+              + struct.pack(">I", 16) + b"i" * 16
+              + struct.pack(">I", 16) + b"c" * 16)
+        vault_tool.VAULT_FILE.write_bytes(v1)
+        current_scrypt = (1, 2, 1, 1)
+
+        with mock.patch.object(
+                vault_tool, "_get_password_with_retry",
+                return_value=("old", bytearray(b"v1 fixture"), 0)), \
+             mock.patch.object(vault_tool, "_get_kdf_params", return_value=current_scrypt) as current, \
+             mock.patch("builtins.input", return_value="n"), \
+             contextlib.redirect_stdout(io.StringIO()):
+            result = vault_tool.migrate_mode()
+
+        self.assertTrue(result)
+        current.assert_called_once_with("scrypt")
+        self.assertEqual(self._metadata_kdf(), current_scrypt)
+        plaintext, _ = vault_tool._decrypt_blob("old", vault_tool.VAULT_FILE.read_bytes())
+        self.assertEqual(bytes(plaintext), b"v1 fixture")
+
+    @unittest.skipUnless(vault_tool._HAS_ARGON2, "argon2-cffi 未安装")
+    def test_unavailable_or_invalid_source_kdf_leaves_original_unchanged(self):
+        argon_kdf = (2, 1, 8192, 1)
+        argon_blob = vault_tool._pack_vault_v3("pw", b"fixture", kdf=argon_kdf)
+        invalid_blob = vault_tool.MAGIC_V3 + b"\x00"
+
+        for label, blob, patch_argon in (
+            ("argon_unavailable", argon_blob, True),
+            ("invalid_structure", invalid_blob, False),
+        ):
+            for mode in (vault_tool.change_password_mode,
+                         vault_tool.setup_decoy_mode, vault_tool.migrate_mode):
+                with self.subTest(case=label, mode=mode.__name__):
+                    vault_tool.VAULT_FILE.write_bytes(blob)
+                    with mock.patch.object(vault_tool, "_HAS_ARGON2", not patch_argon), \
+                         contextlib.redirect_stdout(io.StringIO()):
+                        result = mode()
+                    self.assertFalse(result)
+                    self.assertEqual(vault_tool.VAULT_FILE.read_bytes(), blob)
+                    self.assertFalse(vault_tool.VAULT_FILE.with_suffix(".enc.bak").exists())
+                    self.assertFalse(vault_tool.VAULT_FILE.with_suffix(".enc.pwbak").exists())
 
 
 class TestMenuLoop(unittest.TestCase):
@@ -954,6 +1145,13 @@ class TestMenuLoop(unittest.TestCase):
              mock.patch("builtins.input", return_value=""), \
              contextlib.redirect_stdout(io.StringIO()):
             vault_tool._menu_loop()
+
+    def test_keyboardinterrupt_at_return_prompt_returns_to_menu(self):
+        with mock.patch.object(vault_tool, "_menu", side_effect=[None, "exit"]) as menu, \
+             mock.patch("builtins.input", side_effect=[KeyboardInterrupt()]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            vault_tool._menu_loop()
+        self.assertEqual(menu.call_count, 2)
 
     def test_eof_breaks_loop(self):
         with mock.patch.object(vault_tool, "_menu", side_effect=EOFError()), \
@@ -1140,11 +1338,22 @@ class TestClipboard(unittest.TestCase):
     """剪贴板复制（冒烟测试：不崩溃、返回布尔）。"""
 
     def test_copy_returns_bool(self):
-        result = vault_tool._copy_to_clipboard("test-secret")
+        with mock.patch.object(vault_tool, "_IS_WINDOWS", False), \
+             mock.patch.object(vault_tool.subprocess, "run", side_effect=FileNotFoundError):
+            result = vault_tool._copy_to_clipboard("fixture-text")
         self.assertIsInstance(result, bool)
 
     def test_schedule_clear_no_crash(self):
-        vault_tool._clear_clipboard_later(0.01)  # 不应抛
+        cleared = threading.Event()
+
+        def fake_copy(text):
+            self.assertEqual(text, "")
+            cleared.set()
+            return True
+
+        with mock.patch.object(vault_tool, "_copy_to_clipboard", side_effect=fake_copy):
+            vault_tool._clear_clipboard_later(0)
+            self.assertTrue(cleared.wait(1))
 
 
 class TestMakeTarGzipMtime(unittest.TestCase):

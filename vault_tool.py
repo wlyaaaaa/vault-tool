@@ -385,7 +385,10 @@ def _calibrate_kdf(kind):
 def _get_kdf_params(kind="scrypt"):
     """取已校准的 KDF 参数（进程内缓存，避免每次加密都重新校准）。"""
     if kind == "argon2" and not _HAS_ARGON2:
-        kind = "scrypt"
+        raise ValueError(
+            "已请求 Argon2id，但本机未安装 argon2-cffi；"
+            "请安装后重试，或显式选择 --kdf scrypt。"
+        )
     if kind not in _KDF_PARAMS_CACHE:
         print(_c(f"⏳ 正在校准密钥派生强度（{kind}，目标约 {KDF_TARGET_SECONDS}s）...", _GREY))
         _KDF_PARAMS_CACHE[kind] = _calibrate_kdf(kind)
@@ -1238,6 +1241,15 @@ def _inspect_vault_structure(path):
         raise ValueError("vault format not recognized")
 
 
+def _preserved_kdf_for_rewrite(metadata):
+    """Return an existing V2/V3 KDF tuple, or None for a legacy V1 rewrite."""
+    if metadata["version"] == 1:
+        return None
+    kdf = (metadata["kdf_id"], *metadata["kdf_params_raw"])
+    _validate_kdf(*kdf)
+    return kdf
+
+
 def _detected_vault_format(path):
     try:
         with open(path, "rb") as fh:
@@ -1497,18 +1509,6 @@ def collect_vault_assessment(base=None):
             "source/ exists and can be merged or encrypted locally.",
             requires_password=True,
         ))
-    elif source_exists and not any(a["action"] == "encrypt" for a in actions):
-        risks.append(_risk(
-            "source_ready",
-            "info",
-            "source/ exists; local encryption may be the next action.",
-        ))
-        actions.append(_action(
-            "encrypt",
-            "source/ exists and can be encrypted locally.",
-            requires_password=True,
-        ))
-
     if not environment.get("has_argon2"):
         risks.append(_risk(
             "argon2_unavailable",
@@ -1531,7 +1531,9 @@ def collect_vault_plan(base=None):
     risk_codes = {risk["code"] for risk in assessment["risks"]}
     action_map = {action["action"]: action for action in assessment["recommended_actions"]}
 
-    if "unknown_vault_format" in risk_codes or "old_default_path" in risk_codes:
+    if ("invalid_vault_structure" in risk_codes
+            or "unknown_vault_format" in risk_codes
+            or "old_default_path" in risk_codes):
         decision = "manual_review"
     elif "stale_decrypted_dir" in risk_codes:
         decision = "clean_decrypted"
@@ -1573,9 +1575,10 @@ def _confirm_if_huge(total):
     return input("仍要继续吗？(yes/no): ").strip().lower() in ("y", "yes")
 
 
-def _safe_extractall(tar, dest, name_filter=None):
+def _safe_extractall(tar, dest, name_filter=None, preserve_existing=False):
     """带路径遍历防护的 tar 解压。跳过逃逸到 dest 之外的成员；
-    name_filter 非空时只解压名字含该子串的文件（选择性提取）。"""
+    name_filter 非空时只解压名字含该子串的文件（选择性提取）。
+    preserve_existing 为真时，目标中已有的普通文件优先保留。"""
     dest = Path(dest).resolve()
     nf = name_filter.lower() if name_filter else None
     for member in tar.getmembers():
@@ -1584,6 +1587,8 @@ def _safe_extractall(tar, dest, name_filter=None):
         member_path = (dest / member.name).resolve()
         if not str(member_path).startswith(str(dest) + os.sep) and member_path != dest:
             _warn(f"跳过危险路径：{member.name}")
+            continue
+        if preserve_existing and member.isfile() and member_path.exists():
             continue
         tar.extract(member, dest)
 
@@ -1683,7 +1688,7 @@ def encrypt_mode(overwrite=False, keyfile_path=None, kdf_choice="scrypt"):
     files = _collect_source_files()
     if not files:
         _err(f"{SOURCE_DIR} 下没有任何文件")
-        return
+        return False
 
     total = sum(f.stat().st_size for f in files)
     print(f"\n找到 {_c(str(len(files)), _BOLD)} 个文件，共 {total/1024:.1f} KB：")
@@ -1704,7 +1709,11 @@ def encrypt_mode(overwrite=False, keyfile_path=None, kdf_choice="scrypt"):
     if not password:
         return
 
-    kdf = _get_kdf_params("argon2" if kdf_choice == "argon2" else "scrypt")
+    try:
+        kdf = _get_kdf_params("argon2" if kdf_choice == "argon2" else "scrypt")
+    except ValueError as e:
+        _err(str(e))
+        return False
 
     print(_c("\n⏳ 正在打包并压缩文件 ...", _GREY))
     plaintext = _make_tar(files)
@@ -1721,7 +1730,7 @@ def encrypt_mode(overwrite=False, keyfile_path=None, kdf_choice="scrypt"):
     except Exception as e:
         _err(f"自检失败（{e}），已中止，未删除 source/ 原文。")
         _secure_zero(plaintext)
-        return
+        return False
 
     with open(VAULT_FILE, "wb") as fh:
         fh.write(blob)
@@ -1736,6 +1745,7 @@ def encrypt_mode(overwrite=False, keyfile_path=None, kdf_choice="scrypt"):
         print(_c("💡 同时务必保管好密钥文件，丢失它也会永久无法解密。", _YELLOW))
     _log(f"ENCRYPT: {len(files)} 个文件 -> {len(blob)} bytes (V3"
          + (", keyfile" if keyfile_hash else "") + ")")
+    return True
 
 
 # ───────────────────────── 解密 ─────────────────────────
@@ -1747,7 +1757,7 @@ def decrypt_mode(force_no_disk=False, force_extract=False, keyfile_path=None):
 
     if not VAULT_FILE.exists():
         _err(f"未找到加密文件：{VAULT_FILE}")
-        return
+        return False
 
     ver = vault_version(VAULT_FILE)
     ver_label = {3: "VAULT03 (scrypt+GCM, 支持密钥文件/诱饵)",
@@ -1796,6 +1806,7 @@ def decrypt_mode(force_no_disk=False, force_extract=False, keyfile_path=None):
         del plaintext
         gc.collect()
     _log("DECRYPT: 查看完成" + (" (layer1)" if layer == 1 else ""))
+    return True
 
 
 def _iter_text_members(tar):
@@ -2035,7 +2046,14 @@ def setup_decoy_mode(keyfile_path=None):
 
     if not VAULT_FILE.exists():
         _err(f"未找到加密文件：{VAULT_FILE}")
-        return
+        return False
+
+    try:
+        metadata = _inspect_vault_structure(VAULT_FILE)
+        target_kdf = _preserved_kdf_for_rewrite(metadata)
+    except (OSError, ValueError, struct.error) as e:
+        _err(f"无法保留当前保险库的 KDF（{e}）；未改动原库。")
+        return False
 
     print(_c(
         "\n原理：生成一个双层容器。被胁迫时你交出『诱饵密码』，对方解出一组\n"
@@ -2060,7 +2078,7 @@ def setup_decoy_mode(keyfile_path=None):
         if not decoy_files:
             _err(f"未找到诱饵文件。请把『看起来合理的假文件』放进：{DECOY_SOURCE_DIR}")
             print("   （例如几张普通照片、一份无聊的备忘录）然后重试。")
-            return
+            return False
         print(f"\n诱饵文件（{len(decoy_files)} 个）：")
         for f in decoy_files[:30]:
             print(f"   • {f.relative_to(DECOY_SOURCE_DIR).as_posix()}")
@@ -2074,7 +2092,7 @@ def setup_decoy_mode(keyfile_path=None):
             return
         if decoy_password == real_password:
             _err("诱饵密码不能与真实密码相同。")
-            return
+            return False
 
         decoy_plaintext = _make_tar(decoy_files, DECOY_SOURCE_DIR)
 
@@ -2083,7 +2101,8 @@ def setup_decoy_mode(keyfile_path=None):
         new_blob = _pack_vault_v3(
             real_password, real_plaintext,
             decoy_password=decoy_password, decoy_plaintext=decoy_plaintext,
-            keyfile_hash=keyfile_hash, kdf=_get_kdf_params("scrypt"))
+            keyfile_hash=keyfile_hash,
+            kdf=target_kdf if target_kdf is not None else _get_kdf_params("scrypt"))
 
         # 5) 双向自检：真密码→真实数据，诱饵密码→诱饵数据
         try:
@@ -2097,7 +2116,7 @@ def setup_decoy_mode(keyfile_path=None):
                 raise ValueError("自检内容不一致")
         except Exception as e:
             _err(f"双层自检失败（{e}），已中止，未改动原库。")
-            return
+            return False
         del real_password, decoy_password
 
         # 6) 备份并写入
@@ -2116,6 +2135,7 @@ def setup_decoy_mode(keyfile_path=None):
         print(_c(f"   • 旧库已备份为 {backup.name}，确认无误后请安全删除它"
                  "（否则旧的单层库会暴露你曾改动过）。", _YELLOW))
         _log("DECOY: 双层容器已生成")
+        return True
     finally:
         _secure_zero(real_plaintext)
         _unlock_pages(lock)
@@ -2205,13 +2225,16 @@ def migrate_mode(keyfile_path=None):
     _init_colors()
     _banner("⬆️  升级加密方案（→ VAULT03，明文不落盘）")
 
-    ver = vault_version(VAULT_FILE)
-    if ver is None:
-        _err(f"未找到加密文件：{VAULT_FILE}")
-        return
+    try:
+        metadata = _inspect_vault_structure(VAULT_FILE)
+        target_kdf = _preserved_kdf_for_rewrite(metadata)
+    except (OSError, ValueError, struct.error) as e:
+        _err(f"无法保留当前保险库的 KDF（{e}）；未改动原库。")
+        return False
+    ver = metadata["version"]
     if ver == 3:
         _info("当前保险库已是最新格式（VAULT03），无需升级。")
-        return
+        return True
 
     with open(VAULT_FILE, "rb") as fh:
         blob = fh.read()
@@ -2228,7 +2251,8 @@ def migrate_mode(keyfile_path=None):
 
         print(_c("⏳ 用 VAULT03（内存硬 KDF + AES-256-GCM）重新加密 ...", _GREY))
         new_blob = _pack_vault_v3(password, plaintext, keyfile_hash=keyfile_hash,
-                                  kdf=_get_kdf_params("scrypt"))
+                                  kdf=target_kdf if target_kdf is not None
+                                  else _get_kdf_params("scrypt"))
 
         # 自检
         try:
@@ -2239,13 +2263,14 @@ def migrate_mode(keyfile_path=None):
         except Exception:
             shutil.copy2(backup, VAULT_FILE)
             _err("升级自检失败，已回滚到旧库。")
-            return
+            return False
 
         with open(VAULT_FILE, "wb") as fh:
             fh.write(new_blob)
         _ok(f"升级完成！新格式 VAULT03（{len(new_blob)/1024:.1f} KB）")
         print(_c(f"   确认新库可正常解密后，可手动删除备份：{backup.name}", _GREY))
         _log(f"MIGRATE: V{ver} -> V3")
+        return True
     finally:
         _secure_zero(plaintext)
         _unlock_pages(lock)
@@ -2262,7 +2287,14 @@ def change_password_mode(keyfile_path=None):
 
     if not VAULT_FILE.exists():
         _err(f"未找到加密文件：{VAULT_FILE}")
-        return
+        return False
+
+    try:
+        metadata = _inspect_vault_structure(VAULT_FILE)
+        target_kdf = _preserved_kdf_for_rewrite(metadata)
+    except (OSError, ValueError, struct.error) as e:
+        _err(f"无法保留当前保险库的 KDF（{e}）；未改动原库。")
+        return False
 
     with open(VAULT_FILE, "rb") as fh:
         blob = fh.read()
@@ -2299,7 +2331,7 @@ def change_password_mode(keyfile_path=None):
             return
         if new_password == old_password and new_keyfile_hash == keyfile_hash:
             _warn("新密码与设置均无变化，无需修改。")
-            return
+            return True
         del old_password
 
         backup = VAULT_FILE.with_suffix(".enc.pwbak")
@@ -2307,7 +2339,8 @@ def change_password_mode(keyfile_path=None):
 
         print(_c("\n⏳ 用新密码重新加密（内存硬 KDF，可能需要数秒）...", _GREY))
         new_blob = _pack_vault_v3(new_password, plaintext, keyfile_hash=new_keyfile_hash,
-                                  kdf=_get_kdf_params("scrypt"))
+                                  kdf=target_kdf if target_kdf is not None
+                                  else _get_kdf_params("scrypt"))
 
         try:
             check, _ = _decrypt_blob(new_password, new_blob, new_keyfile_hash)
@@ -2318,7 +2351,7 @@ def change_password_mode(keyfile_path=None):
             shutil.copy2(backup, VAULT_FILE)
             backup.unlink(missing_ok=True)
             _err("修改密码自检失败，已回滚。")
-            return
+            return False
 
         with open(VAULT_FILE, "wb") as fh:
             fh.write(new_blob)
@@ -2327,6 +2360,7 @@ def change_password_mode(keyfile_path=None):
         _ok(f"密码修改成功！新库 {len(new_blob)/1024:.1f} KB（VAULT03）")
         print(_c("💡 请牢记新密码！丢失密码 = 数据永久无法找回。", _YELLOW))
         _log("PASSWD: 密码已修改")
+        return True
     finally:
         _secure_zero(plaintext)
         _unlock_pages(lock)
@@ -2343,12 +2377,15 @@ def vault_info():
 
     if not VAULT_FILE.exists():
         _err(f"未找到加密文件：{VAULT_FILE}")
-        return
+        return False
 
     stat = VAULT_FILE.stat()
     size = stat.st_size
     mtime = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
     ver = vault_version(VAULT_FILE)
+    if ver == 0:
+        _err("保险库容器不完整或格式无法识别；请先人工检查，勿覆盖。")
+        return False
 
     print(f"\n  文件：{VAULT_FILE.name}")
     print(f"  大小：{size:,} bytes（{size/1024:.1f} KB）")
@@ -2401,6 +2438,7 @@ def vault_info():
 
     print()
     _log("INFO: 查看库信息")
+    return True
 
 
 def _find_backups():
@@ -2468,7 +2506,7 @@ def add_files_mode(keyfile_path=None):
             del _pw
             try:
                 with tarfile.open(fileobj=io.BytesIO(bytes(plaintext)), mode="r") as tar:
-                    _safe_extractall(tar, SOURCE_DIR)
+                    _safe_extractall(tar, SOURCE_DIR, preserve_existing=True)
                 merged = True
                 _ok("旧库内容已展开到 source/（新文件会叠加其上，同名则覆盖）。")
             finally:
@@ -2636,8 +2674,11 @@ def _menu_loop():
             _log(f"ERROR: {e!r}")
         try:
             input(_c("\n按 Enter 返回菜单…", _GREY))
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
             break
+        except KeyboardInterrupt:
+            print(_c("\n已取消，返回菜单（要退出请选 [0]）。", _GREY))
+            continue
 
 
 # ───────────────────────── CLI 参数 ─────────────────────────
@@ -2756,17 +2797,21 @@ def main(argv=None):
       # CLI 模式：单次执行；密码锁定 / 中断转为干净的退出码
       try:
         if args.command == "encrypt":
-            encrypt_mode(keyfile_path=args.keyfile, kdf_choice=args.kdf)
+            if encrypt_mode(keyfile_path=args.keyfile, kdf_choice=args.kdf) is False:
+                return 1
         elif args.command == "decrypt":
-            decrypt_mode(force_no_disk=args.no_disk, force_extract=args.extract,
-                         keyfile_path=args.keyfile)
+            if decrypt_mode(force_no_disk=args.no_disk, force_extract=args.extract,
+                            keyfile_path=args.keyfile) is False:
+                return 1
         elif args.command == "migrate":
-            migrate_mode(keyfile_path=args.keyfile)
+            if migrate_mode(keyfile_path=args.keyfile) is False:
+                return 1
         elif args.command == "info":
             if args.json:
                 _print_json(collect_vault_info(VAULT_FILE))
             else:
-                vault_info()
+                if vault_info() is False:
+                    return 1
         elif args.command == "doctor":
             data = collect_doctor_info()
             if args.json:
@@ -2786,9 +2831,11 @@ def main(argv=None):
             else:
                 _print_plan(data)
         elif args.command == "passwd":
-            change_password_mode(keyfile_path=args.keyfile)
+            if change_password_mode(keyfile_path=args.keyfile) is False:
+                return 1
         elif args.command == "decoy":
-            setup_decoy_mode(keyfile_path=args.keyfile)
+            if setup_decoy_mode(keyfile_path=args.keyfile) is False:
+                return 1
         elif args.command == "hide":
             _init_colors()
             out = args.out or str(BASE / ("hidden" + Path(args.cover).suffix))
@@ -2797,6 +2844,7 @@ def main(argv=None):
                 _ok(f"已生成 {out}（内含 {plen/1024:.1f} KB 加密数据）")
             except Exception as e:
                 _err(f"隐写失败：{e}")
+                return 1
         elif args.command == "unhide":
             _init_colors()
             out = args.out or str(BASE / "vault.recovered.enc")
@@ -2805,12 +2853,13 @@ def main(argv=None):
                 _ok(f"已提取 {plen/1024:.1f} KB 到 {out}")
             except Exception as e:
                 _err(f"提取失败：{e}")
+                return 1
       except VaultLocked as e:
           _err(str(e))
-          sys.exit(1)
+          return 1
       except KeyboardInterrupt:
           print()
-          sys.exit(130)
+          return 130
     else:
         # 持久交互菜单：除了 [0] 或强制退出，程序不主动退出
         _menu_loop()
