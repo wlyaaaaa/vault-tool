@@ -171,6 +171,23 @@ elseif (-not (Test-GhNotFoundResponse -Response $existingResponse)) {
 $uploadBytes = [IO.File]::ReadAllBytes($item.FullName)
 $uploadSha256 = Get-Sha256Hex -Bytes $uploadBytes
 
+if (-not $PSCmdlet.ShouldProcess("$Repo/$RemotePath", "upload encrypted vault artifact")) {
+    Write-PublishResult -Result ([ordered]@{
+            repo               = $Repo
+            path               = $RemotePath
+            branch             = $branch
+            commit_sha         = $null
+            blob_sha           = $null
+            bytes              = [Int64]$uploadBytes.Length
+            sha256             = $uploadSha256
+            readback_verified  = $false
+            upload_performed   = $false
+            what_if            = [bool]$WhatIfPreference
+            cancelled          = -not [bool]$WhatIfPreference
+        })
+    return
+}
+
 $body = [ordered]@{
     message = $Message
     content = [Convert]::ToBase64String($uploadBytes)
@@ -183,23 +200,6 @@ if ($existingSha) {
 $tmpPath = [IO.Path]::GetTempFileName()
 try {
     $body | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $tmpPath -Encoding UTF8
-    if (-not $PSCmdlet.ShouldProcess("$Repo/$RemotePath", "upload encrypted vault artifact")) {
-        Write-PublishResult -Result ([ordered]@{
-                repo               = $Repo
-                path               = $RemotePath
-                branch             = $branch
-                commit_sha         = $null
-                blob_sha           = $null
-                bytes              = [Int64]$uploadBytes.Length
-                sha256             = $uploadSha256
-                readback_verified  = $false
-                upload_performed   = $false
-                what_if            = [bool]$WhatIfPreference
-                cancelled          = -not [bool]$WhatIfPreference
-            })
-        return
-    }
-
     $putResponse = Invoke-GhApiText -Endpoint $contentsEndpoint -Method PUT -InputFile $tmpPath
     $commitSha = $null
     if (-not [string]::IsNullOrWhiteSpace($putResponse.Text)) {

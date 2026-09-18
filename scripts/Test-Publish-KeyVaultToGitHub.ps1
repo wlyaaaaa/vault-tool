@@ -381,6 +381,10 @@ try {
     Assert-Equal -Expected 1 -Actual $whatIfRun.State.contents_get_count -Message 'WhatIf preflight lookup count'
     Assert-Equal -Expected 0 -Actual $whatIfRun.State.blob_get_count -Message 'WhatIf blob lookup count'
     Assert-True -Condition (@($whatIfRun.Output | Where-Object { [string]$_ -match 'upload_performed\s*[:=]\s*true|readback_verified\s*[:=]\s*true' }).Count -eq 0) -Message 'WhatIf must not claim publication or readback'
+    $publisherSource = Get-Content -LiteralPath $publishScript -Raw
+    $shouldProcessIndex = $publisherSource.IndexOf('$PSCmdlet.ShouldProcess')
+    $tempFileIndex = $publisherSource.IndexOf('[IO.Path]::GetTempFileName()')
+    Assert-True -Condition ($shouldProcessIndex -ge 0 -and $tempFileIndex -ge 0 -and $shouldProcessIndex -lt $tempFileIndex) -Message 'WhatIf gate must run before request temp-file creation'
 
     $privateCase = Join-Path $runRoot 'non-private'
     New-Item -ItemType Directory -Path $privateCase -Force | Out-Null

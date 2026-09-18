@@ -9,7 +9,7 @@
   - 对称加密：AES-256-GCM（带认证标签，可检测篡改）
   - 压缩：tar + gzip（节省空间，并消除明文统计特征）
   - 双因子：可选「密钥文件」混入密钥派生（密码 + 文件）
-  - 抗胁迫：可选「诱饵密码」——双层容器，无法证明隐藏层是否存在
+  - 抗胁迫：可选「诱饵密码」——双层容器，不使用显式隐藏层标志；不作现实不可识别保证
   - 抗量子：AES-256 对 Grover 算法仍有等效 128 位强度，足够安全
 仍兼容解密旧版 VAULT02（scrypt+GCM）与 VAULT01（PBKDF2 + AES-CBC）。
 
@@ -19,9 +19,12 @@
    请使用足够长的口令（建议 6+ 随机单词，或 16+ 位随机串）。
 """
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 
 import os
+import tempfile
+import copy
+from contextlib import contextmanager
 import stat
 import sys
 import math
@@ -256,7 +259,7 @@ def _strength_bar(pw):
         label, color = "很强", _GREEN
     filled = max(0, min(20, int(bits / 5)))
     bar = "█" * filled + "░" * (20 - filled)
-    return f"  强度 {_c(bar, color)} {_c(label, color)}  (~{bits:.0f} bits)"
+    return f"  强度 {_c(bar, color)} {_c(label, color)}  (仅长度与字符种类提示，非密码熵)"
 
 
 # ───────────────────────── 日志 ─────────────────────────
@@ -310,6 +313,7 @@ def derive_key_scrypt(password, salt, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P,
     则把它拼到密码材料之后实现"密码 + 密钥文件"双因子。
     maxmem 按 N、r 动态计算，使任意（合法）参数都能工作。
     """
+    _validate_kdf(1, n, r, p)
     material = _password_material(password, keyfile_hash)
     maxmem = 128 * n * r + (1 << 24)  # 实际需求 + 16 MB 余量
     return hashlib.scrypt(
@@ -344,19 +348,9 @@ def _derive_key(kdf_id, password, salt, a, b, c, keyfile_hash=None):
 
 
 def _validate_kdf(kdf_id, a, b, c):
-    """解密前校验 KDF 参数，拒绝被篡改成的超大内存需求（防 DoS）。"""
-    if kdf_id == 1:
-        if a < 2 or (a & (a - 1)) != 0:
-            raise ValueError("scrypt N 必须是 2 的幂")
-        if 128 * a * b > MAX_KDF_MEM:
-            raise ValueError("KDF 内存参数过大，拒绝执行")
-    elif kdf_id == 2:
-        if not _HAS_ARGON2:
-            raise ValueError("此库使用 Argon2id 加密，请先安装：pip install argon2-cffi")
-        if b * 1024 > MAX_KDF_MEM:
-            raise ValueError("KDF 内存参数过大，拒绝执行")
-    else:
-        raise ValueError("未知的 KDF id")
+    _validate_container_kdf(kdf_id, a, b, c)
+    if kdf_id == 2 and not _HAS_ARGON2:
+        raise ValueError('Argon2id unavailable; install argon2-cffi. No KDF downgrade performed.')
 
 
 def _calibrate_kdf(kind):
@@ -784,7 +778,11 @@ def secure_delete(filepath, _expected_identity=None):
         opened_stat = os.fstat(fh.fileno())
         if _secure_file_identity(opened_stat) != identity:
             raise RuntimeError(f"安全删除打开的文件与预检对象不一致: {filepath}")
-        fh.write(secrets.token_bytes(max(file_stat.st_size, 512)))
+        remaining = max(file_stat.st_size, 512)
+        while remaining:
+            size = min(remaining, 1024 * 1024)
+            fh.write(secrets.token_bytes(size))
+            remaining -= size
         fh.flush()
         os.fsync(fh.fileno())
     filepath.unlink()
@@ -961,6 +959,7 @@ def _pack_vault(password, plaintext):
 
 def _unpack_vault(password, blob):
     """解密 VAULT02 或 VAULT01，返回明文字节（bytearray，方便后续清零）。失败抛 ValueError。"""
+    _inspect_vault_stream(io.BytesIO(blob))
     magic = blob[:7]
     if magic == MAGIC_V2:
         pos = 7
@@ -975,6 +974,7 @@ def _unpack_vault(password, blob):
         ciphertext = blob[pos:pos + ct_len]
         if kdf_id != 1:
             raise ValueError("unknown KDF id")
+        _validate_kdf(kdf_id, n, r, p)
         key = derive_key_scrypt(password, salt, n=n, r=r, p=p)
         pt = _try_gcm_decrypt(key, nonce, ciphertext, header, tag)
         if pt is None:
@@ -993,7 +993,7 @@ def _unpack_vault(password, blob):
         try:
             padded = _aes_cbc_decrypt(ciphertext, key[:32], iv)
             pad_len = padded[-1]
-            if pad_len < 1 or pad_len > 16:
+            if pad_len < 1 or pad_len > 16 or padded[-pad_len:] != bytes([pad_len]) * pad_len:
                 raise ValueError
             return bytearray(padded[:-pad_len])
         except Exception:
@@ -1080,6 +1080,7 @@ def _unpack_vault_v3(password, blob, keyfile_hash=None):
     layer=0 表示命中 slot0（普通库的真实层 / 诱饵层）；
     layer=1 表示命中 slot1（隐藏的真实层）。失败抛 ValueError。
     """
+    _inspect_vault_stream(io.BytesIO(blob))
     if blob[:7] != MAGIC_V3:
         raise ValueError("不是 VAULT03 容器")
     kdf_id, a, b, c = struct.unpack(">BIII", blob[8:21])
@@ -1150,95 +1151,101 @@ def _skip_container_field(fh, file_size, size, label, *, maximum=_MAX_CONTAINER_
 
 
 def _validate_container_kdf(kdf_id, a, b, c):
-    """Validate encoded KDF metadata without invoking the KDF runtime."""
-    if min(a, b, c) <= 0:
-        raise ValueError("invalid KDF parameters")
+    """Validate encoded resource requirements without running a password KDF."""
+    if any(type(v) is not int or v <= 0 or v > 0xffffffff for v in (a, b, c)):
+        raise ValueError('invalid KDF parameters')
     if kdf_id == 1:
-        if a < 2 or (a & (a - 1)) != 0 or 128 * a * b > MAX_KDF_MEM:
-            raise ValueError("invalid scrypt parameters")
+        if a < 2 or a & (a - 1) or a.bit_length() - 1 >= 16 * b or b * c >= 1 << 30 or 128 * a * b > MAX_KDF_MEM:
+            raise ValueError('invalid scrypt parameters')
+        if not ALLOW_EXPENSIVE_KDF and (c > 16 or a * b * c > 1 << 25):
+            raise ValueError('KDF work budget exceeded; explicit --allow-expensive-kdf recovery required')
     elif kdf_id == 2:
-        if b * 1024 > MAX_KDF_MEM:
-            raise ValueError("invalid Argon2 parameters")
+        if b < 8 * c or b * 1024 > MAX_KDF_MEM:
+            raise ValueError('invalid Argon2 parameters')
+        if not ALLOW_EXPENSIVE_KDF and (a > 16 or c > 64 or a * b > 1 << 24):
+            raise ValueError('KDF work budget exceeded; explicit --allow-expensive-kdf recovery required')
     else:
-        raise ValueError("unknown KDF id")
+        raise ValueError('unknown KDF id')
 
 
 def _inspect_vault_structure(path):
-    """Read bounded container metadata and validate all declared byte ranges.
+    with open(path, "rb") as stream:
+        return _inspect_vault_stream(stream)
 
-    Ciphertext and plaintext are never read.  The returned metadata is safe for
-    version detection and AI-safe assessment, but does not prove authenticity.
-    """
-    path = Path(path)
-    with open(path, "rb") as fh:
-        file_size = os.fstat(fh.fileno()).st_size
-        magic = _read_exact(fh, 7, "vault magic")
 
-        if magic == MAGIC_V3:
-            flags = _read_exact(fh, 1, "VAULT03 flags")[0]
-            kdf_id, a, b, c = struct.unpack(">BIII", _read_exact(fh, 13, "VAULT03 KDF header"))
-            _validate_container_kdf(kdf_id, a, b, c)
-            salt_len = _read_length(fh, ">H", "VAULT03 salt length")
-            _skip_container_field(fh, file_size, salt_len, "VAULT03 salt")
-            nonce_len = _read_length(fh, ">H", "VAULT03 nonce length")
-            _skip_container_field(fh, file_size, nonce_len, "VAULT03 nonce")
-            _read_exact(fh, 16, "VAULT03 authentication tag")
-            ciphertext_len = _read_length(fh, ">Q", "VAULT03 ciphertext length")
-            visible_end = fh.tell() + ciphertext_len
-            if visible_end > file_size:
-                raise ValueError("truncated VAULT03 ciphertext")
-            if file_size != _bucket_size(visible_end):
-                raise ValueError("invalid VAULT03 padded container size")
-            return {
-                "version": 3,
-                "vault_format": "VAULT03",
-                "flags": flags,
-                "kdf_id": kdf_id,
-                "kdf_params_raw": (a, b, c),
-            }
+def _inspect_vault_stream(fh):
+    fh.seek(0, os.SEEK_END)
+    file_size = fh.tell()
+    fh.seek(0)
+    magic = _read_exact(fh, 7, "vault magic")
 
-        if magic == MAGIC_V2:
-            kdf_id, a, b, c = struct.unpack(">BIII", _read_exact(fh, 13, "VAULT02 KDF header"))
-            if kdf_id != 1:
-                raise ValueError("unknown VAULT02 KDF id")
-            _validate_container_kdf(kdf_id, a, b, c)
-            salt_len = _read_length(fh, ">H", "VAULT02 salt length")
-            _skip_container_field(fh, file_size, salt_len, "VAULT02 salt")
-            nonce_len = _read_length(fh, ">H", "VAULT02 nonce length")
-            _skip_container_field(fh, file_size, nonce_len, "VAULT02 nonce")
-            _read_exact(fh, 16, "VAULT02 authentication tag")
-            ciphertext_len = _read_length(fh, ">Q", "VAULT02 ciphertext length")
-            if fh.tell() + ciphertext_len != file_size:
-                raise ValueError("truncated or malformed VAULT02 ciphertext")
-            return {
-                "version": 2,
-                "vault_format": "VAULT02",
-                "flags": None,
-                "kdf_id": kdf_id,
-                "kdf_params_raw": (a, b, c),
-            }
+    if magic == MAGIC_V3:
+        flags = _read_exact(fh, 1, "VAULT03 flags")[0]
+        if flags & ~(FLAG_KEYFILE | FLAG_COMPRESSED):
+            raise ValueError("unknown VAULT03 flags")
+        kdf_id, a, b, c = struct.unpack(">BIII", _read_exact(fh, 13, "VAULT03 KDF header"))
+        _validate_container_kdf(kdf_id, a, b, c)
+        salt_len = _read_length(fh, ">H", "VAULT03 salt length")
+        _skip_container_field(fh, file_size, salt_len, "VAULT03 salt")
+        nonce_len = _read_length(fh, ">H", "VAULT03 nonce length")
+        _skip_container_field(fh, file_size, nonce_len, "VAULT03 nonce")
+        _read_exact(fh, 16, "VAULT03 authentication tag")
+        ciphertext_len = _read_length(fh, ">Q", "VAULT03 ciphertext length")
+        visible_end = fh.tell() + ciphertext_len
+        if visible_end > file_size:
+            raise ValueError("truncated VAULT03 ciphertext")
+        if file_size != _bucket_size(visible_end):
+            raise ValueError("invalid VAULT03 padded container size")
+        return {
+            "version": 3,
+            "vault_format": "VAULT03",
+            "flags": flags,
+            "kdf_id": kdf_id,
+            "kdf_params_raw": (a, b, c),
+        }
 
-        if magic == MAGIC_V1:
-            salt_len = _read_length(fh, ">I", "VAULT01 salt length")
-            _skip_container_field(fh, file_size, salt_len, "VAULT01 salt")
-            iv_len = _read_length(fh, ">I", "VAULT01 IV length")
-            if iv_len != 16:
-                raise ValueError("invalid VAULT01 IV length")
-            _skip_container_field(fh, file_size, iv_len, "VAULT01 IV")
-            ciphertext_len = _read_length(fh, ">I", "VAULT01 ciphertext length")
-            if ciphertext_len <= 0 or ciphertext_len % 16 != 0:
-                raise ValueError("invalid VAULT01 ciphertext length")
-            if fh.tell() + ciphertext_len != file_size:
-                raise ValueError("truncated or malformed VAULT01 ciphertext")
-            return {
-                "version": 1,
-                "vault_format": "VAULT01",
-                "flags": None,
-                "kdf_id": None,
-                "kdf_params_raw": (),
-            }
+    if magic == MAGIC_V2:
+        kdf_id, a, b, c = struct.unpack(">BIII", _read_exact(fh, 13, "VAULT02 KDF header"))
+        if kdf_id != 1:
+            raise ValueError("unknown VAULT02 KDF id")
+        _validate_container_kdf(kdf_id, a, b, c)
+        salt_len = _read_length(fh, ">H", "VAULT02 salt length")
+        _skip_container_field(fh, file_size, salt_len, "VAULT02 salt")
+        nonce_len = _read_length(fh, ">H", "VAULT02 nonce length")
+        _skip_container_field(fh, file_size, nonce_len, "VAULT02 nonce")
+        _read_exact(fh, 16, "VAULT02 authentication tag")
+        ciphertext_len = _read_length(fh, ">Q", "VAULT02 ciphertext length")
+        if fh.tell() + ciphertext_len != file_size:
+            raise ValueError("truncated or malformed VAULT02 ciphertext")
+        return {
+            "version": 2,
+            "vault_format": "VAULT02",
+            "flags": None,
+            "kdf_id": kdf_id,
+            "kdf_params_raw": (a, b, c),
+        }
 
-        raise ValueError("vault format not recognized")
+    if magic == MAGIC_V1:
+        salt_len = _read_length(fh, ">I", "VAULT01 salt length")
+        _skip_container_field(fh, file_size, salt_len, "VAULT01 salt")
+        iv_len = _read_length(fh, ">I", "VAULT01 IV length")
+        if iv_len != 16:
+            raise ValueError("invalid VAULT01 IV length")
+        _skip_container_field(fh, file_size, iv_len, "VAULT01 IV")
+        ciphertext_len = _read_length(fh, ">I", "VAULT01 ciphertext length")
+        if ciphertext_len <= 0 or ciphertext_len % 16 != 0:
+            raise ValueError("invalid VAULT01 ciphertext length")
+        if fh.tell() + ciphertext_len != file_size:
+            raise ValueError("truncated or malformed VAULT01 ciphertext")
+        return {
+            "version": 1,
+            "vault_format": "VAULT01",
+            "flags": None,
+            "kdf_id": None,
+            "kdf_params_raw": (),
+        }
+
+    raise ValueError("vault format not recognized")
 
 
 def _preserved_kdf_for_rewrite(metadata):
@@ -1332,8 +1339,9 @@ def collect_vault_info(path=None):
         }
 
 
-def collect_doctor_info(base=None):
+def collect_doctor_info(base=None, vault_file=None):
     """Return AI-safe environment metadata without reading plaintext files."""
+    explicit_vault = vault_file
     if base is None:
         base_path = BASE
         source_dir = SOURCE_DIR
@@ -1347,6 +1355,8 @@ def collect_doctor_info(base=None):
         vault_file = base_path / "vault.enc"
         log_file = base_path / "vault.log"
 
+    if explicit_vault is not None:
+        vault_file = Path(explicit_vault)
     return {
         "ok": True,
         "base": str(base_path),
@@ -1386,7 +1396,7 @@ def _action(action, reason, requires_password=False):
     }
 
 
-def collect_vault_assessment(base=None):
+def collect_vault_assessment(base=None, vault_file=None):
     """Return AI-safe vault risk assessment without decrypting or listing files."""
     if base is None:
         base_path = BASE
@@ -1395,8 +1405,10 @@ def collect_vault_assessment(base=None):
         base_path = Path(base)
         vault_path = base_path / "vault.enc"
 
+    if vault_file is not None:
+        vault_path = Path(vault_file)
     vault = collect_vault_info(vault_path)
-    environment = collect_doctor_info(base_path)
+    environment = collect_doctor_info(base_path, vault_file=vault_path)
     risks = []
     actions = []
 
@@ -1525,9 +1537,9 @@ def collect_vault_assessment(base=None):
     }
 
 
-def collect_vault_plan(base=None):
+def collect_vault_plan(base=None, vault_file=None):
     """Return one deterministic next-action plan from AI-safe assessment metadata."""
-    assessment = collect_vault_assessment(base)
+    assessment = collect_vault_assessment(base, vault_file=vault_file)
     risk_codes = {risk["code"] for risk in assessment["risks"]}
     action_map = {action["action"]: action for action in assessment["recommended_actions"]}
 
@@ -1563,7 +1575,7 @@ def collect_vault_plan(base=None):
 
 def _tar_total_size(tar):
     """tar 内所有成员声明的解压后总大小（用于压缩炸弹防护，无需真正解压）。"""
-    return sum(m.size for m in tar.getmembers() if m.isfile())
+    return sum(m.size for m in _bounded_members(tar) if m.isfile())
 
 
 def _confirm_if_huge(total):
@@ -1576,21 +1588,17 @@ def _confirm_if_huge(total):
 
 
 def _safe_extractall(tar, dest, name_filter=None, preserve_existing=False):
-    """带路径遍历防护的 tar 解压。跳过逃逸到 dest 之外的成员；
-    name_filter 非空时只解压名字含该子串的文件（选择性提取）。
-    preserve_existing 为真时，目标中已有的普通文件优先保留。"""
-    dest = Path(dest).resolve()
-    nf = name_filter.lower() if name_filter else None
-    for member in tar.getmembers():
-        if nf and nf not in member.name.lower():
-            continue
-        member_path = (dest / member.name).resolve()
-        if not str(member_path).startswith(str(dest) + os.sep) and member_path != dest:
-            _warn(f"跳过危险路径：{member.name}")
-            continue
-        if preserve_existing and member.isfile() and member_path.exists():
-            continue
-        tar.extract(member, dest)
+    # Compatibility API: all exports now preserve both existing and concurrent files.
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode='w', format=tarfile.PAX_FORMAT) as output:
+        for member in _bounded_members(tar):
+            stream = tar.extractfile(member) if member.isfile() else None
+            try:
+                output.addfile(member, stream)
+            finally:
+                if stream is not None:
+                    stream.close()
+    return export_archive(buffer.getvalue(), dest, name_filter)
 
 
 def _collect_source_files(src_dir=None):
@@ -1601,26 +1609,8 @@ def _collect_source_files(src_dir=None):
 
 
 def _make_tar(files, src_dir=None):
-    """打包 source/ 文件为 tar.gz 字节。文件多时显示进度。
-
-    使用 gzip 压缩：节省空间，并让明文更接近随机分布、消除统计特征。
-    解密侧用 mode='r'（透明自动识别压缩），向后兼容旧的未压缩 tar。
-    """
-    src_dir = src_dir or SOURCE_DIR
-    buf = io.BytesIO()
-    total = len(files)
-    # 手动包一层 GzipFile 并把 mtime 固定为 0：去掉 gzip 头里的时间戳元数据。
-    # （文件本身的 mtime 仍保留在 tar 成员里，解压后时间不丢失。）
-    gz = gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=6, mtime=0)
-    try:
-        with tarfile.open(fileobj=gz, mode="w") as tar:
-            for i, f in enumerate(files, 1):
-                tar.add(f, arcname=f.relative_to(src_dir).as_posix())
-                if total > 10 and i % max(1, total // 10) == 0:
-                    print(_c(f"   打包进度：{i}/{total} ({i * 100 // total}%)", _GREY))
-    finally:
-        gz.close()
-    return buf.getvalue()
+    payload, _, _ = archive_explicit_inputs(files, relative_to=src_dir or SOURCE_DIR)
+    return payload
 
 
 # ───────────────────── 密码输入（带重试延迟） ─────────────────────
@@ -1680,72 +1670,47 @@ def _read_password_twice(prompt1, prompt2):
 
 # ───────────────────────── 加密 ─────────────────────────
 
-def encrypt_mode(overwrite=False, keyfile_path=None, kdf_choice="scrypt"):
+def encrypt_mode(overwrite=False, keyfile_path=None, kdf_choice='scrypt', cleanup_source=False):
     _check_platform()
     _init_colors()
-    _banner("🔐 加密模式")
-
-    files = _collect_source_files()
-    if not files:
-        _err(f"{SOURCE_DIR} 下没有任何文件")
+    _banner('加密模式（默认保留原件）')
+    if not SOURCE_DIR.is_dir():
+        _err('source/ 不存在')
         return False
-
-    total = sum(f.stat().st_size for f in files)
-    print(f"\n找到 {_c(str(len(files)), _BOLD)} 个文件，共 {total/1024:.1f} KB：")
-    for f in files[:50]:
-        print(f"   • {f.relative_to(SOURCE_DIR).as_posix()} ({f.stat().st_size} bytes)")
-    if len(files) > 50:
-        print(f"   … 以及另外 {len(files) - 50} 个文件")
-
-    if VAULT_FILE.exists() and not overwrite:
-        ans = input(_c(f"\n⚠️  {VAULT_FILE.name} 已存在，覆盖？(yes/no): ", _YELLOW)).strip().lower()
-        if ans not in ("y", "yes"):
-            print("已取消")
-            return
-
+    original = VAULT_FILE.read_bytes() if VAULT_FILE.exists() else None
+    if original is not None and not overwrite:
+        if input('已有库。新建将替换整份容器并保留密文恢复副本，继续？(yes/no): ').strip().lower() not in ('y', 'yes'):
+            return False
     keyfile_hash = _prompt_keyfile_for_encrypt(keyfile_path)
-
-    password = _read_password_twice("\n请输入加密密码（不回显）：", "请再次确认密码：")
+    password = _read_password_twice('请输入加密密码：', '请再次确认密码：')
     if not password:
-        return
-
-    try:
-        kdf = _get_kdf_params("argon2" if kdf_choice == "argon2" else "scrypt")
-    except ValueError as e:
-        _err(str(e))
         return False
-
-    print(_c("\n⏳ 正在打包并压缩文件 ...", _GREY))
-    plaintext = _make_tar(files)
-    print(_c("⏳ 正在派生密钥（内存硬，可能需要数秒）...", _GREY))
-    blob = _pack_vault_v3(password, plaintext, keyfile_hash=keyfile_hash, kdf=kdf)
-
-    # 删除原文前先自检：确认这把密码（+密钥文件）真能解开新库
-    print(_c("⏳ 写入前自检（确认可解密）...", _GREY))
+    plaintext = None
     try:
-        check, _ = _decrypt_blob(password, blob, keyfile_hash)
-        if bytes(check) != bytes(plaintext):
-            raise ValueError("自检内容不一致")
-        _secure_zero(check)
-    except Exception as e:
-        _err(f"自检失败（{e}），已中止，未删除 source/ 原文。")
+        kdf = _get_kdf_params('argon2' if kdf_choice == 'argon2' else 'scrypt')
+        plaintext, count, snapshots = archive_explicit_inputs([SOURCE_DIR], relative_to=SOURCE_DIR)
+        if not count:
+            _err('没有待加密的普通文件')
+            return False
+        plaintext = reserve_edit_capacity(plaintext)
+        blob = _pack_vault_v3(password, plaintext, keyfile_hash=keyfile_hash, kdf=kdf)
+        if original is not None:
+            recovery = VAULT_FILE.with_name(VAULT_FILE.name + '.replaced.' + secrets.token_hex(4) + '.enc')
+            commit_ciphertext(recovery, None, original, lambda value: _inspect_vault_stream(io.BytesIO(value)))
+            _info('原密文恢复副本：' + str(recovery))
+        commit_ciphertext(VAULT_FILE, original, blob, lambda value: verify_rewrite(value, password, keyfile_hash, 0, plaintext))
+        if cleanup_source:
+            preserved = cleanup_archived_snapshot(snapshots)
+            if preserved:
+                _warn(f'{len(preserved)} 个新增、变化或无法核对的原件未删除。')
+        _ok(f'已验证保存 {count} 个文件；' + ('仅清理已验证快照。' if cleanup_source else '原文件保持不变。'))
+        _log('ENCRYPT: verified ciphertext committed; source cleanup=' + str(bool(cleanup_source)))
+        return True
+    except (ValueError, OSError, tarfile.TarError) as exc:
+        _err('加密未完成：' + str(exc))
+        return False
+    finally:
         _secure_zero(plaintext)
-        return False
-
-    with open(VAULT_FILE, "wb") as fh:
-        fh.write(blob)
-    _ok(f"已加密保存至：{VAULT_FILE}（{len(blob)/1024:.1f} KB）")
-
-    print(_c("🗑️  安全删除 source/ 原始文件 ...", _GREY))
-    secure_delete_dir(SOURCE_DIR)
-    _secure_zero(plaintext)
-    _ok("原始文件已安全删除")
-    print(_c("\n💡 请牢记密码！丢失密码 = 数据永久无法找回。", _YELLOW))
-    if keyfile_hash:
-        print(_c("💡 同时务必保管好密钥文件，丢失它也会永久无法解密。", _YELLOW))
-    _log(f"ENCRYPT: {len(files)} 个文件 -> {len(blob)} bytes (V3"
-         + (", keyfile" if keyfile_hash else "") + ")")
-    return True
 
 
 # ───────────────────────── 解密 ─────────────────────────
@@ -1786,7 +1751,7 @@ def decrypt_mode(force_no_disk=False, force_extract=False, keyfile_path=None):
             choice = "1"
         else:
             print("\n请选择查看方式：")
-            print("  " + _c("[1]", _BOLD) + " 不落盘安全查看（默认）— 明文只在内存，强杀/崩溃/断电都不可恢复")
+            print("  " + _c("[1]", _BOLD) + " 不落盘安全查看（默认）— 明文只在内存，不主动导出；不保证系统不存在其他副本")
             print("  " + _c("[2]", _BOLD) + " 解压到 decrypted/ 文件夹 — 可用外部程序打开任意文件")
             print("      （正常退出/Ctrl+C 会自动安全删除；但强行杀进程仍可能残留明文）")
             choice = input("选择 [1/2，回车=1]: ").strip() or "1"
@@ -1805,7 +1770,7 @@ def decrypt_mode(force_no_disk=False, force_extract=False, keyfile_path=None):
         _unlock_pages(lock)
         del plaintext
         gc.collect()
-    _log("DECRYPT: 查看完成" + (" (layer1)" if layer == 1 else ""))
+    _log("DECRYPT: local viewing completed")
     return True
 
 
@@ -1936,7 +1901,7 @@ def _view_in_memory(plaintext):
 
     # 清除终端屏幕及回滚缓冲区，防止明文残留在终端历史中
     _clear_terminal()
-    _ok("屏幕已清除。明文仅存在于刚才的显示中，现已不可恢复。\n")
+    _ok("屏幕已清除。明文仅存在于刚才的显示中，本次查看结束；不保证系统不存在其他副本。\n")
 
 
 def _extract_to_folder(plaintext, name_filter=None):
@@ -2012,7 +1977,7 @@ def _extract_to_folder(plaintext, name_filter=None):
         _rule("─", _CYAN)
         _warn("此模式下若被强行杀进程/断电，decrypted/ 明文可能残留。")
         print(_c("（按 Ctrl+X 可立即紧急销毁）", _GREY))
-        _pause_or_panic("📖 阅读完毕后按 Enter，明文将被安全删除（不可恢复）...", panic)
+        _pause_or_panic("📖 阅读完毕后按 Enter，本次导出明文将被清理...", panic)
     finally:
         cleanup()
         for sig, handler in prev_handlers.items():
@@ -2057,7 +2022,7 @@ def setup_decoy_mode(keyfile_path=None):
 
     print(_c(
         "\n原理：生成一个双层容器。被胁迫时你交出『诱饵密码』，对方解出一组\n"
-        "看似合理的假文件；你的真实数据在另一层，数学上无法证明它存在。\n", _GREY))
+        "看似合理的假文件；你的真实数据在另一层，容器不记录其存在标志；不保证日志、历史或多次快照下不可识别。\n", _GREY))
 
     with open(VAULT_FILE, "rb") as fh:
         blob = fh.read()
@@ -2117,24 +2082,20 @@ def setup_decoy_mode(keyfile_path=None):
         except Exception as e:
             _err(f"双层自检失败（{e}），已中止，未改动原库。")
             return False
-        del real_password, decoy_password
-
-        # 6) 备份并写入
-        backup = VAULT_FILE.with_suffix(".enc.bak")
-        shutil.copy2(VAULT_FILE, backup)
-        with open(VAULT_FILE, "wb") as fh:
-            fh.write(new_blob)
-
-        # 7) 安全删除诱饵明文
-        secure_delete_dir(DECOY_SOURCE_DIR)
+        # Both source and prior ciphertext are retained. Never replace a prior backup.
+        backup = preserve_ciphertext_backup(VAULT_FILE, blob)
+        def verify(value):
+            verify_rewrite(value, real_password, keyfile_hash, 1, bytes(real_plaintext))
+            verify_rewrite(value, decoy_password, keyfile_hash, 0, bytes(decoy_plaintext))
+        commit_ciphertext(VAULT_FILE, blob, new_blob, verify)
 
         _ok(f"诱饵已设置！新库 {len(new_blob)/1024:.1f} KB（VAULT03 双层）")
         print(_c("\n  记住：", _BOLD))
-        print(_c("   • 被胁迫时交出『诱饵密码』→ 对方解出假文件，满意离开。", _GREY))
-        print(_c("   • 你的真实数据用『真实密码』打开，对方无法证明它存在。", _GREY))
+        print(_c("   • 被胁迫时交出『诱饵密码』→ 该密码只打开相应内容；本工具不保证现实中的抗胁迫效果。", _GREY))
+        print(_c("   • 你的真实数据用『真实密码』打开，不保证在现实胁迫或历史快照中不可识别。", _GREY))
         print(_c(f"   • 旧库已备份为 {backup.name}，确认无误后请安全删除它"
                  "（否则旧的单层库会暴露你曾改动过）。", _YELLOW))
-        _log("DECOY: 双层容器已生成")
+        _log("UPDATE: verified container saved")
         return True
     finally:
         _secure_zero(real_plaintext)
@@ -2245,8 +2206,7 @@ def migrate_mode(keyfile_path=None):
     try:
         keyfile_hash = _prompt_keyfile_for_encrypt(keyfile_path)
 
-        backup = VAULT_FILE.with_suffix(".enc.bak")
-        shutil.copy2(VAULT_FILE, backup)
+        backup = preserve_ciphertext_backup(VAULT_FILE, blob)
         print(_c(f"📦 已备份旧库到：{backup.name}", _GREY))
 
         print(_c("⏳ 用 VAULT03（内存硬 KDF + AES-256-GCM）重新加密 ...", _GREY))
@@ -2261,12 +2221,11 @@ def migrate_mode(keyfile_path=None):
                 raise ValueError("自检不一致")
             _secure_zero(check)
         except Exception:
-            shutil.copy2(backup, VAULT_FILE)
-            _err("升级自检失败，已回滚到旧库。")
+            _err("升级自检失败，原库未改动，恢复副本保留。")
             return False
 
-        with open(VAULT_FILE, "wb") as fh:
-            fh.write(new_blob)
+        commit_ciphertext(VAULT_FILE, blob, new_blob,
+                          lambda value: verify_rewrite(value, password, keyfile_hash, 0, bytes(plaintext)))
         _ok(f"升级完成！新格式 VAULT03（{len(new_blob)/1024:.1f} KB）")
         print(_c(f"   确认新库可正常解密后，可手动删除备份：{backup.name}", _GREY))
         _log(f"MIGRATE: V{ver} -> V3")
@@ -2282,90 +2241,39 @@ def migrate_mode(keyfile_path=None):
 
 def change_password_mode(keyfile_path=None):
     _check_platform()
-    _init_colors()
-    _banner("🔑 修改密码")
-
-    if not VAULT_FILE.exists():
-        _err(f"未找到加密文件：{VAULT_FILE}")
+    if not VAULT_FILE.is_file():
+        _err('未找到保险库')
         return False
-
+    plaintext = None
     try:
         metadata = _inspect_vault_structure(VAULT_FILE)
-        target_kdf = _preserved_kdf_for_rewrite(metadata)
-    except (OSError, ValueError, struct.error) as e:
-        _err(f"无法保留当前保险库的 KDF（{e}）；未改动原库。")
-        return False
-
-    with open(VAULT_FILE, "rb") as fh:
-        blob = fh.read()
-
-    keyfile_hash = _prompt_keyfile_for_decrypt(blob, keyfile_path)
-    old_password, plaintext, layer = _get_password_with_retry(
-        "请输入当前密码：", blob, keyfile_hash)
-    _ok("当前密码验证通过")
-
-    if blob[:7] == MAGIC_V3 and layer == 1:
-        _warn("当前命中的是隐藏（真实）层。注意：本功能会把它重新打包为普通单层库，")
-        print("   原有的诱饵层将不再保留（如需诱饵请重新用菜单 [6] 设置）。")
-
-    lock = _lock_pages(plaintext)
-    try:
-        # 可选更换/移除密钥文件
-        new_keyfile_hash = keyfile_hash
-        ans = input("是否更改密钥文件设置？[y/N]: ").strip().lower()
-        if ans in ("y", "yes"):
-            sub = input("  [1] 使用/更换密钥文件  [2] 移除密钥文件  [回车=不变]: ").strip()
-            if sub == "1":
-                path = input("  新密钥文件路径: ").strip().strip('"')
-                try:
-                    new_keyfile_hash = _keyfile_hash(path)
-                except Exception as e:
-                    _err(f"读取失败：{e}，保持原设置。")
-            elif sub == "2":
-                new_keyfile_hash = None
-                _info("将移除密钥文件要求。")
-
-        new_password = _read_password_twice(
-            "\n请输入新密码（不回显）：", "请再次确认新密码：")
-        if not new_password:
-            return
-        if new_password == old_password and new_keyfile_hash == keyfile_hash:
-            _warn("新密码与设置均无变化，无需修改。")
-            return True
-        del old_password
-
-        backup = VAULT_FILE.with_suffix(".enc.pwbak")
-        shutil.copy2(VAULT_FILE, backup)
-
-        print(_c("\n⏳ 用新密码重新加密（内存硬 KDF，可能需要数秒）...", _GREY))
-        new_blob = _pack_vault_v3(new_password, plaintext, keyfile_hash=new_keyfile_hash,
-                                  kdf=target_kdf if target_kdf is not None
-                                  else _get_kdf_params("scrypt"))
-
-        try:
-            check, _ = _decrypt_blob(new_password, new_blob, new_keyfile_hash)
-            if bytes(check) != bytes(plaintext):
-                raise ValueError("自检不一致")
-            _secure_zero(check)
-        except Exception:
-            shutil.copy2(backup, VAULT_FILE)
-            backup.unlink(missing_ok=True)
-            _err("修改密码自检失败，已回滚。")
+        if metadata['version'] != 3:
+            _err('请先明确执行旧格式迁移；改密不会隐式迁移格式。')
             return False
-
-        with open(VAULT_FILE, "wb") as fh:
-            fh.write(new_blob)
-        backup.unlink(missing_ok=True)
-
-        _ok(f"密码修改成功！新库 {len(new_blob)/1024:.1f} KB（VAULT03）")
-        print(_c("💡 请牢记新密码！丢失密码 = 数据永久无法找回。", _YELLOW))
-        _log("PASSWD: 密码已修改")
+        _preserved_kdf_for_rewrite(metadata)
+        original = VAULT_FILE.read_bytes()
+        key_hash = _prompt_keyfile_for_decrypt(original, keyfile_path)
+        old_password, plaintext, layer = _get_password_with_retry('请输入当前密码：', original, key_hash)
+        ans = input('是否更改密钥文件设置？[y/N]: ').strip().lower()
+        if ans in ('y', 'yes'):
+            _info('密钥文件影响共享头部。请用 rebuild --out 创建凭据变更副本；原库保留。')
+            return False
+        password = _read_password_twice('请输入新密码：', '请再次确认新密码：')
+        if not password:
+            return False
+        if password == old_password:
+            _info('凭据未变化，未重写密文。')
+            return True
+        candidate, expected = replace_unlocked_slot(original, password, key_hash, layer, bytes(plaintext))
+        commit_ciphertext(VAULT_FILE, original, candidate, lambda value: verify_rewrite(value, password, key_hash, layer, expected))
+        _ok('密码修改成功，另一槽位与原 KDF 保持不变。')
+        _log('PASSWD: selected content re-encrypted')
         return True
+    except (ValueError, OSError) as exc:
+        _err('改密未完成：' + str(exc))
+        return False
     finally:
         _secure_zero(plaintext)
-        _unlock_pages(lock)
-        del plaintext
-        gc.collect()
 
 
 # ───────────────────────── 查看库信息 ─────────────────────────
@@ -2442,13 +2350,11 @@ def vault_info():
 
 
 def _find_backups():
-    """列出磁盘上的库备份文件。"""
-    pats = ("*.enc.bak", "*.enc.pwbak", "*.enc.v1bak", "*.pwbak")
-    found = []
-    for pat in pats:
-        found.extend(BASE.glob(pat))
-    # 去重
-    return sorted(set(found))
+    files = set()
+    for pattern in ('vault.enc.bak', 'vault.enc.pwbak', 'vault.enc.replaced.*.enc',
+                    'vault.enc.recovery.*.enc', '.vault.enc.*.rollback.enc'):
+        files.update(BASE.glob(pattern))
+    return sorted(p for p in files if p.is_file() and not p.is_symlink())
 
 
 def clean_backups_mode():
@@ -2479,85 +2385,61 @@ def clean_backups_mode():
 # ───────────────────────── 加密 / 添加文件（引导式） ─────────────────────────
 
 def add_files_mode(keyfile_path=None):
-    """引导式加密：把文件/文件夹加入保险库。
-
-    设计要点（避免老菜单的两个坑）：
-      - 始终可用：不再要求你先手动建 source/、再隐藏入口。
-      - 不丢数据：已有库时，先解密合并旧内容，再叠加新文件——而不是直接覆盖。
-    """
+    """Merge in memory; never decrypt an existing vault into the source folder."""
     _check_platform()
-    _init_colors()
-    _banner("🔐 加密 / 添加文件")
     SOURCE_DIR.mkdir(exist_ok=True)
-
-    merged = False
-    # 已有库：先（可选）解密合并，杜绝"加一个文件却把整库覆盖没了"
-    if VAULT_FILE.exists():
-        _warn("已存在保险库。要在不丢失旧内容的前提下加文件，需要先解密合并。")
-        ans = input(
-            "解密并合并旧库内容？[Y/n]（选 n 将用新文件覆盖整库，旧内容会丢失）: "
-        ).strip().lower()
-        if ans in ("", "y", "yes"):
-            with open(VAULT_FILE, "rb") as fh:
-                blob = fh.read()
-            kf = _prompt_keyfile_for_decrypt(blob, keyfile_path)
-            _pw, plaintext, _layer = _get_password_with_retry(
-                "请输入现有库密码：", blob, kf)
-            del _pw
-            try:
-                with tarfile.open(fileobj=io.BytesIO(bytes(plaintext)), mode="r") as tar:
-                    _safe_extractall(tar, SOURCE_DIR, preserve_existing=True)
-                merged = True
-                _ok("旧库内容已展开到 source/（新文件会叠加其上，同名则覆盖）。")
-            finally:
-                _secure_zero(plaintext)
-                del plaintext
-                gc.collect()
-
-    # 展示当前 source/ 内容
-    cur = _collect_source_files()
-    if cur:
-        print(f"\n当前 source/ 已有 {len(cur)} 个文件：")
-        for f in cur[:30]:
-            print("   • " + f.relative_to(SOURCE_DIR).as_posix())
-        if len(cur) > 30:
-            print(f"   … 以及另外 {len(cur) - 30} 个")
-    elif not merged:
-        # 空目录：顺手打开它，邀请用户拖文件进去
-        try:
-            if _IS_WINDOWS:
-                os.startfile(SOURCE_DIR)
-        except Exception:
-            pass
-
-    # 追加新文件：粘贴路径，或直接已放进 source/
-    print(_c("\n把要加密的文件/文件夹放进 source/，或在下面粘贴它们的完整路径：", _GREY))
-    while True:
-        line = input("路径（一行一个，回车结束）: ").strip().strip('"').strip("'")
-        if not line:
-            break
-        src = Path(line).expanduser()
-        if not src.exists():
-            _err(f"路径不存在：{src}")
-            continue
-        try:
-            dest = SOURCE_DIR / src.name
-            if src.is_dir():
-                shutil.copytree(src, dest, dirs_exist_ok=True)
-            else:
-                shutil.copy2(src, dest)
-            _ok(f"已加入：{src.name}")
-        except Exception as e:
-            _err(f"复制失败：{e}")
-
-    if not _collect_source_files():
-        _warn("source/ 里没有任何文件，已取消。")
-        return
-
-    if merged:
-        _info("接下来设置（新）库密码——可沿用原密码。")
-    # 交给 encrypt_mode：列文件 → 密钥文件 → 密码 → 压缩打包 → 自检 → 写入 → 安全删 source/
-    encrypt_mode(overwrite=True, keyfile_path=keyfile_path)
+    original = VAULT_FILE.read_bytes() if VAULT_FILE.exists() else None
+    plaintext = None
+    selected = []
+    if any(SOURCE_DIR.iterdir()):
+        selected.extend(sorted(SOURCE_DIR.iterdir()))
+    try:
+        if original is not None:
+            if input('在当前密码对应内容中合并文件？[Y/n]: ').strip().lower() not in ('', 'y', 'yes'):
+                _info('已取消；整体重建请使用 encrypt 或 rebuild，新副本不会删除原库。')
+                return False
+            key_hash = _prompt_keyfile_for_decrypt(original, keyfile_path)
+            password, plaintext, layer = _get_password_with_retry('请输入现有库密码：', original, key_hash)
+        while True:
+            line = input('添加路径（一行一个，回车结束）：').strip().strip('"').strip("'")
+            if not line:
+                break
+            selected.append(Path(line).expanduser())
+        if not selected:
+            return False
+        added, count, _ = archive_explicit_inputs(selected)
+        if original is None:
+            key_hash = _prompt_keyfile_for_encrypt(keyfile_path)
+            password = _read_password_twice('新密码：', '确认新密码：')
+            if not password:
+                return False
+            added = reserve_edit_capacity(added)
+            candidate = _pack_vault_v3(password, added, keyfile_hash=key_hash, kdf=_get_kdf_params())
+            expected, layer = added, 0
+        else:
+            merged = {}
+            for payload in (bytes(plaintext), added):
+                with tarfile.open(fileobj=io.BytesIO(payload), mode='r:*') as archive:
+                    for member in _bounded_members(archive):
+                        name = _safe_member_name(member.name)
+                        if not (member.isfile() or member.isdir()) or member.sparse is not None:
+                            raise VaultOperationError('unsupported_archive')
+                        content = archive.extractfile(member).read() if member.isfile() else None
+                        merged[name.casefold()] = (copy.deepcopy(member), content)
+            buffer = io.BytesIO()
+            with tarfile.open(fileobj=buffer, mode='w', format=tarfile.PAX_FORMAT) as archive:
+                for member, content in merged.values():
+                    archive.addfile(member, io.BytesIO(content) if content is not None else None)
+            packed = gzip.compress(buffer.getvalue(), mtime=0)
+            candidate, expected = replace_unlocked_slot(original, password, key_hash, layer, packed)
+        commit_ciphertext(VAULT_FILE, original, candidate, lambda value: verify_rewrite(value, password, key_hash, layer, expected))
+        _ok(f'已添加/合并 {count} 个文件；原件保留，未解锁槽位保留。')
+        return True
+    except (ValueError, OSError, tarfile.TarError) as exc:
+        _err('合并未完成：' + str(exc) + '；容量不足时请 rebuild 到新副本，原库不变。')
+        return False
+    finally:
+        _secure_zero(plaintext)
 
 
 # ───────────────────────── 交互菜单 ─────────────────────────
@@ -2689,6 +2571,7 @@ def _parse_args(argv=None):
         epilog="不带子命令运行则进入交互菜单。",
     )
     parser.add_argument("--version", action="version", version=f"vault_tool {__version__}")
+    parser.add_argument("--allow-expensive-kdf", action="store_true", help="Explicit recovery opt-in beyond ordinary KDF work budget; memory ceiling still applies")
     parser.add_argument("--no-color", action="store_true", help="禁用彩色输出")
     sub = parser.add_subparsers(dest="command")
 
@@ -2732,6 +2615,26 @@ def _parse_args(argv=None):
     unhide.add_argument("--in", dest="infile", required=True, help="隐写图片路径")
     unhide.add_argument("--out", help="还原输出路径")
 
+    enc.add_argument("--cleanup-source", action="store_true", help="Delete only unchanged, verified archived source files after ciphertext readback")
+    for command in (info, doctor, assess, plan):
+        command.add_argument("--vault-file", help="Exact vault to inspect; no fallback when supplied")
+    plan.add_argument("--operation", choices=['encrypt','decrypt-export','change-password','local-edit','migrate','rebuild','hide','unhide'])
+    plan.add_argument("--input-path", action="append", default=[])
+    plan.add_argument("--output-path")
+    cp = sub.add_parser("credential-plan", help="Read-only password/keyfile/migration plan")
+    cp.add_argument("--vault-file", required=True)
+    cp.add_argument("--change", choices=['password','keyfile','migrate','rebuild'], default='password')
+    cp.add_argument("--json", action='store_true')
+    rc = sub.add_parser("recovery-check", help="Read-only runtime and optional in-memory synthetic recovery test")
+    rc.add_argument("--vault-file")
+    rc.add_argument("--self-test", action='store_true')
+    rc.add_argument("--json", action='store_true')
+    rebuild = sub.add_parser("rebuild", help="Create an expanded/credential-changed copy, preserving the original")
+    rebuild.add_argument("--out", required=True)
+    rebuild.add_argument("--keyfile")
+    rebuild.add_argument("--input-path", action='append', default=[])
+    clean = sub.add_parser("clean-plaintext", help="Explicit cleanup of the local decrypted directory")
+    clean.add_argument("--confirm", action='store_true', help="Explicitly authorize this cleanup")
     return parser.parse_args(argv)
 
 
@@ -2779,28 +2682,26 @@ def main(argv=None):
 
     args = _parse_args(argv)
     json_mode = (
+        args.command in ("credential-plan", "recovery-check") or
         (args.command == "info" and getattr(args, "json", False))
         or (args.command == "doctor" and getattr(args, "json", False))
         or (args.command == "assess" and getattr(args, "json", False))
         or (args.command == "plan" and getattr(args, "json", False))
     )
-    global _NO_COLOR_FLAG
+    global _NO_COLOR_FLAG, ALLOW_EXPENSIVE_KDF
+    ALLOW_EXPENSIVE_KDF = args.allow_expensive_kdf
     _NO_COLOR_FLAG = args.no_color
     _init_colors()
 
-    # Formatting never changes the side effects of diagnostic commands.
-    metadata_only = args.command in {"info", "doctor", "assess", "plan"}
-    if not json_mode:
+    if args.command not in ("info", "doctor", "assess", "plan", "credential-plan", "recovery-check"):
         print()
-    if not metadata_only:
         _setup_logging()
-        _cleanup_stale_plaintext()
 
     if args.command:
       # CLI 模式：单次执行；密码锁定 / 中断转为干净的退出码
       try:
         if args.command == "encrypt":
-            if encrypt_mode(keyfile_path=args.keyfile, kdf_choice=args.kdf) is False:
+            if encrypt_mode(keyfile_path=args.keyfile, kdf_choice=args.kdf, cleanup_source=args.cleanup_source) is False:
                 return 1
         elif args.command == "decrypt":
             if decrypt_mode(force_no_disk=args.no_disk, force_extract=args.extract,
@@ -2810,29 +2711,42 @@ def main(argv=None):
             if migrate_mode(keyfile_path=args.keyfile) is False:
                 return 1
         elif args.command == "info":
-            if args.json:
-                _print_json(collect_vault_info(VAULT_FILE))
-            else:
-                if vault_info() is False:
+            if args.json or args.vault_file:
+                data = collect_vault_info(Path(args.vault_file) if args.vault_file else VAULT_FILE)
+                _print_json(data)
+                if not args.json and (not data.get("ok") or not data.get("exists")):
                     return 1
+            elif vault_info() is False:
+                return 1
         elif args.command == "doctor":
-            data = collect_doctor_info()
+            data = collect_doctor_info(vault_file=args.vault_file)
             if args.json:
                 _print_json(data)
             else:
                 _print_doctor_info(data)
         elif args.command == "assess":
-            data = collect_vault_assessment()
+            data = collect_vault_assessment(vault_file=args.vault_file)
             if args.json:
                 _print_json(data)
             else:
                 _print_assessment(data)
         elif args.command == "plan":
-            data = collect_vault_plan()
+            data = (collect_operation_plan(args.operation, args.vault_file, args.input_path, args.output_path) if args.operation else collect_vault_plan(vault_file=args.vault_file))
             if args.json:
                 _print_json(data)
             else:
-                _print_plan(data)
+                _print_json(data) if args.operation else _print_plan(data)
+        elif args.command == "credential-plan":
+            _print_json(collect_credential_plan(args.vault_file, args.change))
+        elif args.command == "recovery-check":
+            _print_json(collect_recovery_check(args.vault_file, args.self_test))
+        elif args.command == "rebuild":
+            return 0 if rebuild_mode(args.out, args.keyfile, args.input_path) else 1
+        elif args.command == "clean-plaintext":
+            if not args.confirm:
+                _err("Cleanup requires explicit --confirm; no files changed.")
+                return 1
+            _cleanup_stale_plaintext()
         elif args.command == "passwd":
             if change_password_mode(keyfile_path=args.keyfile) is False:
                 return 1
@@ -2869,6 +2783,666 @@ def main(argv=None):
     if not json_mode:
         print()
     return 0
+
+
+
+
+MAX_ARCHIVE_MEMBERS = 10000
+
+
+MAX_ARCHIVE_BYTES = 4 * 1024 * 1024 * 1024
+
+
+MAX_LOCAL_TEXT_BYTES = 64 * 1024 * 1024
+
+
+ALLOW_EXPENSIVE_KDF = False
+
+
+def reserve_edit_capacity(payload):
+    """Reserve bounded room in newly created gzip slots, not in existing opaque slots."""
+    if not payload.startswith(b"\x1f\x8b"):
+        return payload
+    extra = max(4096, min(len(payload) // 4, 1024 * 1024))
+    return payload + b"\0" * extra
+
+
+class VaultOperationError(ValueError):
+    def __init__(self, code, recovery_copy=None, *, count=0, skipped_count=0,
+                 plaintext_written=False, residual_count=0):
+        super().__init__(code)
+        self.code = code
+        self.recovery_copy = recovery_copy
+        self.count = count
+        self.skipped_count = skipped_count
+        self.plaintext_written = plaintext_written
+        self.residual_count = residual_count
+
+
+def _reject_reparse_chain(path):
+    """Check the original lexical path before resolve() discards link identity."""
+    path = Path(os.path.abspath(os.fspath(path)))
+    for part in (path, *path.parents):
+        try:
+            info = part.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or _is_reparse_point(info):
+            raise VaultOperationError('reparse_point_rejected')
+    return path
+
+
+def _file_snapshot(path):
+    path = _reject_reparse_chain(path)
+    meta = path.lstat()
+    if not stat.S_ISREG(meta.st_mode):
+        raise VaultOperationError('special_entry_rejected')
+    return (meta.st_dev, meta.st_ino, meta.st_mode, meta.st_nlink,
+            meta.st_size, meta.st_mtime_ns)
+
+
+def _safe_member_name(name):
+    if not isinstance(name, str) or not name or '\x00' in name or '\\' in name:
+        raise VaultOperationError('unsafe_archive_path')
+    parts = name.rstrip('/').split('/')
+    reserved = {'CON', 'PRN', 'AUX', 'NUL', *(f'COM{i}' for i in range(1, 10)),
+                *(f'LPT{i}' for i in range(1, 10))}
+    if any(not p or p in ('.', '..') or ':' in p or p.endswith((' ', '.'))
+           or p.split('.')[0].upper() in reserved for p in parts):
+        raise VaultOperationError('unsafe_archive_path')
+    return '/'.join(parts)
+
+
+def _bounded_members(archive, *, max_bytes=None):
+    limit = MAX_ARCHIVE_BYTES if max_bytes is None else max_bytes
+    total = 0
+    members = []
+    for member in archive:
+        if len(members) >= MAX_ARCHIVE_MEMBERS or member.size < 0:
+            raise VaultOperationError('archive_budget_exceeded')
+        total += member.size
+        if total > limit:
+            raise VaultOperationError('archive_budget_exceeded')
+        members.append(member)
+    return members
+
+
+def archive_explicit_inputs(inputs, *, relative_to=None):
+    """Pack an exact stable selection; metadata snapshots never leave the process."""
+    roots = [_reject_reparse_chain(item) for item in inputs]
+    if not roots:
+        raise VaultOperationError('input_path_required')
+    selection = []
+    seen = set()
+    total = 0
+    for root in roots:
+        if not root.exists():
+            raise VaultOperationError('input_path_unavailable')
+        base = Path(relative_to).absolute() if relative_to is not None else root.parent
+        pending = [root]
+        while pending:
+            item = pending.pop()
+            _reject_reparse_chain(item)
+            meta = item.lstat()
+            if stat.S_ISDIR(meta.st_mode):
+                children = sorted(item.iterdir(), key=lambda p: p.name.casefold(), reverse=True)
+                pending.extend(children)
+                if relative_to is not None and item == base:
+                    continue
+            elif not stat.S_ISREG(meta.st_mode):
+                raise VaultOperationError('special_entry_rejected')
+            name = _safe_member_name(item.relative_to(base).as_posix())
+            if name.casefold() in seen:
+                raise VaultOperationError('duplicate_input_name')
+            seen.add(name.casefold())
+            total += meta.st_size if stat.S_ISREG(meta.st_mode) else 0
+            if total > MAX_ARCHIVE_BYTES or len(selection) >= MAX_ARCHIVE_MEMBERS:
+                raise VaultOperationError('archive_budget_exceeded')
+            selection.append((item, name, meta))
+    buffer = io.BytesIO()
+    snapshots = []
+    with gzip.GzipFile(fileobj=buffer, mode='wb', compresslevel=6, mtime=0) as zipped:
+        with tarfile.open(fileobj=zipped, mode='w', format=tarfile.PAX_FORMAT) as archive:
+            for item, name, meta in selection:
+                member = tarfile.TarInfo(name)
+                member.mode, member.mtime = stat.S_IMODE(meta.st_mode), meta.st_mtime
+                if stat.S_ISDIR(meta.st_mode):
+                    member.type = tarfile.DIRTYPE
+                    archive.addfile(member)
+                    continue
+                before = _file_snapshot(item)
+                if (before[0], before[1], before[4], before[5]) != (meta.st_dev, meta.st_ino, meta.st_size, meta.st_mtime_ns):
+                    raise VaultOperationError('source_changed')
+                member.size = before[4]
+                digest = hashlib.sha256()
+                with item.open('rb') as source:
+                    opened = os.fstat(source.fileno())
+                    if (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns) != (before[0], before[1], before[4], before[5]):
+                        raise VaultOperationError('source_changed')
+                    class Reader:
+                        def read(self, size=-1):
+                            block = source.read(size)
+                            digest.update(block)
+                            return block
+                    archive.addfile(member, Reader())
+                if _file_snapshot(item) != before:
+                    raise VaultOperationError('source_changed')
+                snapshots.append((item, before, digest.hexdigest()))
+    if any(_file_snapshot(path) != identity for path, identity, digest in snapshots):
+        raise VaultOperationError('source_changed')
+    return buffer.getvalue(), len(snapshots), snapshots
+
+
+def _hash_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def cleanup_archived_snapshot(snapshots):
+    """Delete only archived, still-identical regular files; never rescan-delete a tree."""
+    preserved = []
+    for path, identity, digest in snapshots:
+        try:
+            if _file_snapshot(path) != identity or _hash_file(path) != digest:
+                preserved.append(path)
+                continue
+            secure_delete(path, _expected_identity=identity[:5])
+        except (OSError, ValueError, RuntimeError):
+            preserved.append(path)
+    return preserved
+
+
+@contextmanager
+def _vault_write_lock(path):
+    """Serialize this product's concurrent commits; no password/authorization state."""
+    name = hashlib.sha256(os.path.normcase(str(Path(path).absolute())).encode('utf-8')).hexdigest()
+    if sys.platform == 'win32':
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+        kernel.CreateMutexW.restype = ctypes.c_void_p
+        kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel.ReleaseMutex.argtypes = [ctypes.c_void_p]
+        kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+        handle = kernel.CreateMutexW(None, False, 'Local\\VaultToolWrite-' + name)
+        if not handle:
+            raise VaultOperationError('vault_busy')
+        acquired = False
+        try:
+            acquired = kernel.WaitForSingleObject(handle, 0) in (0, 0x80)
+            if not acquired:
+                raise VaultOperationError('vault_busy')
+            yield
+        finally:
+            if acquired:
+                kernel.ReleaseMutex(handle)
+            kernel.CloseHandle(handle)
+    else:
+        import fcntl
+        # Stable lock inode is intentionally kept in the OS temporary directory.
+        lock_path = Path(tempfile.gettempdir()) / ('vault-tool-write-' + name + '.lock')
+        with lock_path.open('a+b') as stream:
+            try:
+                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise VaultOperationError('vault_busy') from exc
+            try:
+                yield
+            finally:
+                fcntl.flock(stream, fcntl.LOCK_UN)
+
+
+def publish_no_replace(candidate, output):
+    candidate, output = Path(candidate), _reject_reparse_chain(output)
+    if sys.platform == 'win32':
+        os.rename(candidate, output)
+    else:
+        os.link(candidate, output)
+        candidate.unlink()
+
+
+def _write_ciphertext_temp(path, suffix, blob):
+    descriptor, name = tempfile.mkstemp(prefix='.' + Path(path).name + '.', suffix=suffix, dir=Path(path).parent)
+    candidate = Path(name)
+    try:
+        with os.fdopen(descriptor, 'wb') as stream:
+            stream.write(blob)
+            stream.flush()
+            os.fsync(stream.fileno())
+        return candidate
+    except BaseException:
+        candidate.unlink(missing_ok=True)
+        raise
+
+
+def commit_ciphertext(path, original, candidate, verify):
+    """One canonical readback/rollback implementation for CLI and local GUI."""
+    path = _reject_reparse_chain(path)
+    pending = backup = restoration = None
+    replaced = False
+    with _vault_write_lock(path):
+        try:
+            verify(candidate)
+            pending = _write_ciphertext_temp(path, '.pending.enc', candidate)
+            if pending.read_bytes() != candidate:
+                raise VaultOperationError('ciphertext_self_check_failed')
+            verify(pending.read_bytes())
+            if original is None:
+                publish_no_replace(pending, path)
+            else:
+                if path.read_bytes() != original:
+                    raise VaultOperationError('vault_changed')
+                backup = _write_ciphertext_temp(path, '.rollback.enc', original)
+                if backup.read_bytes() != original or path.read_bytes() != original:
+                    raise VaultOperationError('vault_changed')
+                os.replace(pending, path)
+            replaced = True
+            current = path.read_bytes()
+            if current != candidate:
+                raise VaultOperationError('vault_changed')
+            verify(current)
+        except Exception as exc:
+            if replaced and original is None:
+                try:
+                    if path.read_bytes() == candidate:
+                        path.unlink()
+                except OSError:
+                    raise VaultOperationError('save_failed', str(path)) from None
+            if replaced and original is not None:
+                try:
+                    # Never roll back over content written by another application.
+                    if path.read_bytes() != candidate:
+                        raise OSError('concurrent target change')
+                    restoration = _write_ciphertext_temp(path, '.restore.enc', original)
+                    os.replace(restoration, path)
+                    if path.read_bytes() != original:
+                        raise OSError('rollback verification failed')
+                except Exception:
+                    recovery = str(backup)
+                    backup = None
+                    raise VaultOperationError('rollback_failed', recovery) from None
+            if isinstance(exc, VaultOperationError):
+                raise
+            raise VaultOperationError('output_exists' if isinstance(exc, FileExistsError) else 'save_failed') from None
+        finally:
+            residual = []
+            for item in (pending, backup, restoration):
+                if item is not None:
+                    try:
+                        item.unlink(missing_ok=True)
+                    except OSError:
+                        residual.append(item)
+            if residual and sys.exc_info()[0] is None:
+                raise VaultOperationError('ciphertext_cleanup_failed', str(residual[0]), residual_count=len(residual))
+
+
+def preserve_ciphertext_backup(path, original):
+    path = Path(path)
+    backup = path.with_suffix(".enc.bak")
+    if backup.exists():
+        backup = path.with_name(path.name + ".recovery." + secrets.token_hex(6) + ".enc")
+    commit_ciphertext(backup, None, original,
+                      lambda value: _inspect_vault_stream(io.BytesIO(value)))
+    return backup
+
+
+def vault_slot_layout(blob):
+    try:
+        _inspect_vault_stream(io.BytesIO(blob))
+        if blob[:7] != MAGIC_V3 or blob[7] & ~(FLAG_COMPRESSED | FLAG_KEYFILE) or not blob[7] & FLAG_COMPRESSED:
+            raise ValueError('unsupported flags')
+        if struct.unpack('>H', blob[21:23])[0] != 32 or struct.unpack('>H', blob[55:57])[0] != 12:
+            raise ValueError('unsupported layout')
+        capacity = struct.unpack('>Q', blob[85:93])[0]
+        visible_end = 93 + capacity
+        if visible_end + 60 > len(blob):
+            raise ValueError('truncated slot')
+        return visible_end, capacity, struct.unpack('>BIII', blob[8:21])
+    except (ValueError, IndexError, struct.error):
+        raise VaultOperationError('unsupported_edit_format') from None
+
+
+def slot_capacity(blob, layer):
+    end, capacity, _ = vault_slot_layout(blob)
+    if layer not in (0, 1):
+        raise VaultOperationError('unsupported_edit_format')
+    return capacity if layer == 0 else len(blob) - end - 68
+
+
+def replace_unlocked_slot(blob, password, keyfile_hash, layer, packed):
+    end, capacity, kdf = vault_slot_layout(blob)
+    if bool(blob[7] & FLAG_KEYFILE) != bool(keyfile_hash):
+        raise VaultOperationError('keyfile_policy_conflict')
+    available = slot_capacity(blob, layer)
+    if len(packed) > available:
+        raise VaultOperationError('slot_capacity_exceeded')
+    salt, nonce = secrets.token_bytes(32), secrets.token_bytes(12)
+    key = _derive_key(kdf[0], password, salt, *kdf[1:], keyfile_hash)
+    if layer == 0:
+        expected = packed + b'\0' * (capacity - len(packed))
+        ciphertext, tag = _aes_gcm('encrypt', key, nonce, expected, aad=blob[:21] + salt + nonce)
+        result = blob[:21] + struct.pack('>H', 32) + salt + struct.pack('>H', 12) + nonce + tag + struct.pack('>Q', capacity) + ciphertext + blob[end:]
+    else:
+        expected = packed
+        inner = struct.pack('>Q', len(packed)) + packed + secrets.token_bytes(available - len(packed))
+        ciphertext, tag = _aes_gcm('encrypt', key, nonce, inner, aad=salt + nonce)
+        result = blob[:end] + salt + nonce + tag + ciphertext
+    return result, expected
+
+
+def verify_rewrite(blob, password, keyfile_hash, layer, expected):
+    checked, actual_layer = _decrypt_blob(password, blob, keyfile_hash)
+    try:
+        if actual_layer != layer or bytes(checked) != expected:
+            raise VaultOperationError('ciphertext_self_check_failed')
+    finally:
+        _secure_zero(checked)
+
+
+def export_archive(payload, destination, name_filter=None):
+    """Atomic per-file export; retries verify equal files and preserve conflicts."""
+    destination = _reject_reparse_chain(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    count = already = conflicts = skipped = 0
+    wrote = False
+    pending = None
+    residual = 0
+    try:
+        with tarfile.open(fileobj=io.BytesIO(payload), mode='r:*') as archive:
+            members = _bounded_members(archive)
+            for member in members:
+                if name_filter and name_filter.casefold() not in member.name.casefold():
+                    continue
+                if member.name.rstrip('/') in ('', '.') and member.isdir():
+                    continue
+                try:
+                    relative = _safe_member_name(member.name)
+                except VaultOperationError:
+                    skipped += 1
+                    continue
+                target = _reject_reparse_chain(destination / relative)
+                try:
+                    target.relative_to(destination)
+                except ValueError:
+                    skipped += 1
+                    continue
+                if member.isdir():
+                    if target.exists() and not target.is_dir():
+                        conflicts += 1
+                    else:
+                        target.mkdir(parents=True, exist_ok=True)
+                    continue
+                if not member.isfile() or member.sparse is not None:
+                    skipped += 1
+                    continue
+                with archive.extractfile(member) as source:
+                    if target.exists():
+                        digest = hashlib.sha256()
+                        for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                            digest.update(chunk)
+                        if target.is_file() and target.stat().st_size == member.size and _hash_file(target) == digest.hexdigest():
+                            already += 1
+                        else:
+                            conflicts += 1
+                        continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    descriptor, temp_name = tempfile.mkstemp(prefix='.vault-export-', suffix='.part', dir=target.parent)
+                    pending = Path(temp_name)
+                    digest, written = hashlib.sha256(), 0
+                    with os.fdopen(descriptor, 'wb') as output:
+                        while chunk := source.read(1024 * 1024):
+                            wrote = True  # Conservatively true even if the OS reports a partial write error.
+                            output.write(chunk)
+                            written += len(chunk)
+                            digest.update(chunk)
+                        output.flush()
+                        os.fsync(output.fileno())
+                    if written != member.size or _hash_file(pending) != digest.hexdigest():
+                        raise VaultOperationError('export_verification_failed')
+                    try:
+                        publish_no_replace(pending, target)
+                        count += 1
+                        try:
+                            os.utime(target, (member.mtime, member.mtime))
+                        except OSError:
+                            pass
+                    except FileExistsError:
+                        conflicts += 1
+                    finally:
+                        pending.unlink(missing_ok=True)
+                        pending = None
+    except Exception as exc:
+        if pending is not None:
+            try:
+                pending.unlink(missing_ok=True)
+            except OSError:
+                residual += 1
+        raise VaultOperationError('export_failed', count=count,
+                                  skipped_count=already + conflicts + skipped,
+                                  plaintext_written=wrote, residual_count=residual) from exc
+    return {'count': count, 'already_count': already, 'conflict_count': conflicts,
+            'skipped_count': already + conflicts + skipped, 'unsupported_count': skipped,
+            'plaintext_written_to_disk': wrote, 'residual_count': residual,
+            'status': 'partial' if conflicts or skipped else 'pass'}
+
+
+def collect_operation_plan(operation, vault_file=None, inputs=None, output_path=None):
+    allowed = {'encrypt', 'decrypt-export', 'change-password', 'local-edit', 'migrate', 'rebuild', 'hide', 'unhide'}
+    result = {**_ai_safe_contract('operation-plan'), 'operation': operation,
+              'vault_file': str(vault_file) if vault_file else None,
+              'input_paths': [str(p) for p in (inputs or [])],
+              'output_path': str(output_path) if output_path else None,
+              'requires_password': operation not in ('hide', 'unhide'),
+              'will_write_plaintext': operation == 'decrypt-export',
+              'source_files_preserved': True, 'credentials_verified': False,
+              'content_verified': False, 'target_validated': False,
+              'planned': True, 'errors': [], 'input_count': 0, 'input_bytes': 0,
+              'resource_limits': {'archive_bytes': MAX_ARCHIVE_BYTES, 'archive_members': MAX_ARCHIVE_MEMBERS,
+                                  'local_text_bytes': MAX_LOCAL_TEXT_BYTES},
+              'other_slot_policy': 'preserve_opaque' if operation in ('change-password', 'local-edit') else 'original_preserved_in_new_copy' if operation == 'rebuild' else 'not_applicable'}
+    if operation not in allowed:
+        result['errors'].append('operation_required')
+    if operation in ('decrypt-export', 'change-password', 'local-edit', 'migrate', 'rebuild', 'hide'):
+        if not vault_file:
+            result['errors'].append('vault_file_required')
+        else:
+            result['vault'] = collect_vault_info(Path(vault_file))
+            if not result['vault'].get('structure_valid'):
+                result['errors'].append('vault_structure_invalid')
+            if operation in ('change-password', 'local-edit') and result['vault'].get('vault_format') != 'VAULT03':
+                result['errors'].append('unsupported_edit_format')
+    if operation in ('encrypt', 'rebuild', 'decrypt-export', 'hide', 'unhide'):
+        if not output_path:
+            result['errors'].append('output_path_required')
+        else:
+            out = Path(output_path)
+            try:
+                _reject_reparse_chain(out)
+                if operation != 'decrypt-export' and out.exists():
+                    result['errors'].append('output_exists')
+                if operation == 'decrypt-export' and out.exists() and not out.is_dir():
+                    result['errors'].append('output_not_directory')
+                if operation != 'decrypt-export' and not out.parent.is_dir():
+                    result['errors'].append('output_parent_missing')
+            except (ValueError, OSError):
+                result['errors'].append('output_path_invalid')
+    if operation == 'encrypt':
+        if not inputs:
+            result['errors'].append('input_path_required')
+        else:
+            try:
+                names = set()
+                for value in inputs:
+                    root = _reject_reparse_chain(value)
+                    if not root.exists():
+                        raise VaultOperationError('input_path_unavailable')
+                    if root.name.casefold() in names:
+                        raise VaultOperationError('duplicate_input_name')
+                    names.add(root.name.casefold())
+                    pending = [root]
+                    while pending:
+                        item = pending.pop()
+                        _reject_reparse_chain(item)
+                        if item.is_dir():
+                            pending.extend(item.iterdir())
+                        elif item.is_file():
+                            result['input_count'] += 1
+                            result['input_bytes'] += item.stat().st_size
+                        else:
+                            raise VaultOperationError('special_entry_rejected')
+                        if result['input_count'] > MAX_ARCHIVE_MEMBERS or result['input_bytes'] > MAX_ARCHIVE_BYTES:
+                            raise VaultOperationError('archive_budget_exceeded')
+            except (ValueError, OSError) as exc:
+                result['errors'].append(getattr(exc, 'code', 'input_path_unavailable'))
+    result['ok'] = not result['errors']
+    result['target_validated'] = result['ok']
+    return result
+
+
+def collect_credential_plan(vault_file, change='password'):
+    result = {**_ai_safe_contract('credential-plan'), 'vault_file': str(vault_file) if vault_file else None,
+              'change': change, 'credentials_verified': False, 'requires_password': True,
+              'changes_shared_header': change == 'keyfile', 'source_preserved': True,
+              'other_slot_presence': 'unknown', 'errors': []}
+    if change not in ('password', 'keyfile', 'migrate', 'rebuild'):
+        result['errors'].append('invalid_credential_change')
+    if not vault_file:
+        result['errors'].append('vault_file_required')
+        result['ok'] = False
+        return result
+    result['vault'] = collect_vault_info(Path(vault_file))
+    if not result['vault'].get('structure_valid'):
+        result['errors'].append('vault_structure_invalid')
+    version = result['vault'].get('vault_format')
+    result['in_place_supported'] = change == 'password' and version == 'VAULT03'
+    result['requires_new_output'] = not result['in_place_supported']
+    result['entry'] = 'passwd' if result['in_place_supported'] else 'rebuild --out <new.enc>'
+    result['other_slot_policy'] = 'preserve_opaque' if result['in_place_supported'] else 'authenticate_selected_slots_and_preserve_original'
+    result['ok'] = not result['errors']
+    return result
+
+
+def collect_recovery_check(vault_file=None, self_test=False):
+    result = {**_ai_safe_contract('recovery-check'), 'python_supported': sys.version_info >= (3, 11),
+              'python_version': '.'.join(map(str, sys.version_info[:3])),
+              'crypto_backend': 'windows-cng' if _IS_WINDOWS else 'cryptography',
+              'backend_available': _IS_WINDOWS or _HAS_CRYPTOGRAPHY,
+              'argon2_available': _HAS_ARGON2, 'credentials_verified': False,
+              'real_vault_decrypted': False, 'self_test_executed': False,
+              'self_test_passed': None, 'errors': []}
+    if vault_file:
+        result['vault'] = collect_vault_info(Path(vault_file))
+        if not result['vault'].get('structure_valid'):
+            result['errors'].append('vault_structure_invalid')
+        if result['vault'].get('kdf') == 'argon2id' and not _HAS_ARGON2:
+            result['errors'].append('argon2_unavailable')
+    if not result['python_supported'] or not result['backend_available']:
+        result['errors'].append('recovery_runtime_unavailable')
+    if self_test and not result['errors']:
+        result['self_test_executed'] = True
+        try:
+            # Fictional, one-use credentials and payload; no disk, UI or real vault.
+            password = secrets.token_hex(24)
+            plaintext = b'Vault recovery environment synthetic roundtrip v1'
+            blob = _pack_vault_v3(password, plaintext, kdf=(1, 1 << 14, 8, 1))
+            check, layer = _decrypt_blob(password, blob)
+            try:
+                result['self_test_passed'] = bytes(check) == plaintext and layer == 0
+            finally:
+                _secure_zero(check)
+            try:
+                _decrypt_blob(password + '-wrong', blob)
+            except ValueError:
+                pass
+            else:
+                result['self_test_passed'] = False
+            if not result['self_test_passed']:
+                result['errors'].append('recovery_self_test_failed')
+        except Exception:
+            result['self_test_passed'] = False
+            result['errors'].append('recovery_self_test_failed')
+    result['ok'] = not result['errors']
+    return result
+
+
+def rebuild_mode(output_path, keyfile_path=None, added_inputs=None):
+    """Create an explicitly selected credential/capacity copy, never replace its source."""
+    original = VAULT_FILE.read_bytes()
+    output = _reject_reparse_chain(output_path)
+    if output.exists() or not output.parent.is_dir():
+        _err('需要新的、父目录存在的输出文件。')
+        return False
+    old_key = _prompt_keyfile_for_decrypt(original, keyfile_path)
+    _pw, first, first_layer = _get_password_with_retry('原库密码：', original, old_key)
+    second = None
+    try:
+        _info('原库始终保留。只迁移本次已打开的内容时，未打开内容仍只在原库。')
+        second_password = getpass('同时保留另一个已知密码对应内容时输入该密码；否则直接回车：') if original[:7] == MAGIC_V3 else ''
+        if second_password:
+            second, second_layer = _decrypt_blob(second_password, original, old_key)
+            if second_layer == first_layer:
+                raise VaultOperationError('same_slot_selected_twice')
+        elif input('确认只复制已打开内容并保留原库？输入 COPY：').strip() != 'COPY':
+            return False
+        payload = bytes(first)
+        if added_inputs:
+            added, _, _ = archive_explicit_inputs(added_inputs)
+            entries = {}
+            for data in (payload, added):
+                with tarfile.open(fileobj=io.BytesIO(data), mode='r:*') as archive:
+                    for member in _bounded_members(archive):
+                        _safe_member_name(member.name)
+                        if not (member.isfile() or member.isdir()) or member.sparse is not None:
+                            raise VaultOperationError('unsupported_archive')
+                        content = archive.extractfile(member).read() if member.isfile() else None
+                        entries[member.name.casefold()] = (copy.deepcopy(member), content)
+            buffer = io.BytesIO()
+            with tarfile.open(fileobj=buffer, mode='w', format=tarfile.PAX_FORMAT) as archive:
+                for member, content in entries.values():
+                    archive.addfile(member, io.BytesIO(content) if content is not None else None)
+            payload = gzip.compress(buffer.getvalue(), mtime=0)
+        new_key = _prompt_keyfile_for_encrypt(None)
+        new_password = _read_password_twice('新副本中本次内容的密码：', '确认新密码：')
+        if not new_password:
+            return False
+        metadata = _inspect_vault_structure(VAULT_FILE)
+        kdf = _preserved_kdf_for_rewrite(metadata) or _get_kdf_params()
+        checks = []
+        if second is None:
+            candidate = _pack_vault_v3(new_password, payload, keyfile_hash=new_key, kdf=kdf)
+            checks.append((new_password, 0, payload))
+        else:
+            new_second_password = _read_password_twice('新副本中另一份内容的密码：', '确认另一密码：')
+            if not new_second_password or new_second_password == new_password:
+                raise VaultOperationError('distinct_passwords_required')
+            visible, hidden = (payload, bytes(second)) if first_layer == 0 else (bytes(second), payload)
+            visible_password, hidden_password = (new_password, new_second_password) if first_layer == 0 else (new_second_password, new_password)
+            # Padding is inside the visible gzip slot; no archive member is fabricated.
+            while _bucket_size(93 + len(visible)) - (93 + len(visible)) - 68 < len(hidden):
+                if not visible.startswith(b'\x1f\x8b'):
+                    raise VaultOperationError('unsupported_edit_format')
+                visible += b'\0' * max(len(hidden), 65536)
+                if len(visible) > MAX_ARCHIVE_BYTES:
+                    raise VaultOperationError('archive_budget_exceeded')
+            candidate = _pack_vault_v3(hidden_password, hidden, decoy_password=visible_password,
+                                      decoy_plaintext=visible, keyfile_hash=new_key, kdf=kdf)
+            checks.extend(((visible_password, 0, visible), (hidden_password, 1, hidden)))
+        def verify(value):
+            for password, layer, expected in checks:
+                verify_rewrite(value, password, new_key, layer, expected)
+        if VAULT_FILE.read_bytes() != original:
+            raise VaultOperationError('vault_changed')
+        commit_ciphertext(output, None, candidate, verify)
+        _ok('新副本已写回验证；原库未替换：' + str(output))
+        return True
+    except (ValueError, OSError, tarfile.TarError) as exc:
+        _err('新副本未完成：' + str(exc))
+        return False
+    finally:
+        _secure_zero(first)
+        _secure_zero(second)
 
 
 if __name__ == "__main__":

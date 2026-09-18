@@ -825,7 +825,7 @@ class TestPasswordEntropy(unittest.TestCase):
         self.assertGreater(strong, weak)
 
     def test_strength_bar_runs(self):
-        self.assertIn("bits", vault_tool._strength_bar("some-password"))
+        self.assertIn("非密码熵", vault_tool._strength_bar("some-password"))
 
 
 def _fast_kdf(password, salt, n=None, r=None, p=None, keyfile_hash=None):
@@ -892,12 +892,12 @@ class _FlowBase(unittest.TestCase):
 
 
 class TestEncryptDecryptFlow(_FlowBase):
-    def test_encrypt_creates_v3_and_deletes_source(self):
+    def test_encrypt_creates_v3_and_preserves_source(self):
         self.make_source(**{"a.txt": "alpha", "b.txt": "beta"})
         self.run_with(lambda: vault_tool.encrypt_mode(overwrite=True),
                       ["pw", "pw"], ["n"])
         self.assertTrue(vault_tool.VAULT_FILE.exists())
-        self.assertFalse(vault_tool.SOURCE_DIR.exists())
+        self.assertTrue(vault_tool.SOURCE_DIR.exists())
         self.assertEqual(vault_tool.vault_version(vault_tool.VAULT_FILE), 3)
         self.assertEqual(self.names_in_vault("pw"), {"a.txt", "b.txt"})
 
@@ -940,13 +940,12 @@ class TestAddFilesFlow(_FlowBase):
         self.assertIn("old.txt", names)
         self.assertIn("new.txt", names)
 
-    def test_no_merge_overwrites(self):
+    def test_declined_merge_preserves_existing_vault(self):
         self._make_initial("pw-A")
-        solo = self.tmp / "solo.txt"
-        solo.write_text("SOLO", encoding="utf-8")
-        self.run_with(lambda: vault_tool.add_files_mode(),
-                       ["pw-B", "pw-B"], ["n", str(solo), "", "n"])
-        self.assertEqual(self.names_in_vault("pw-B"), {"solo.txt"})
+        before = vault_tool.VAULT_FILE.read_bytes()
+        self.run_with(lambda: vault_tool.add_files_mode(), [], ["n"])
+        self.assertEqual(before, vault_tool.VAULT_FILE.read_bytes())
+        self.assertEqual(self.names_in_vault("pw-A"), {"old.txt"})
 
     def test_merge_same_name_keeps_new_source_content(self):
         self._make_initial("pw-A")
@@ -993,7 +992,7 @@ class TestDecoyFlow(_FlowBase):
                       ["realpw", "decoypw", "decoypw"], [])
         self.assertIn("real.txt", self.names_in_vault("realpw"))
         self.assertIn("fake.txt", self.names_in_vault("decoypw"))
-        self.assertFalse(vault_tool.DECOY_SOURCE_DIR.exists())
+        self.assertTrue(vault_tool.DECOY_SOURCE_DIR.exists())
 
 
 class TestKdfPreservationFlow(_FlowBase):

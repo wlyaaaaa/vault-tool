@@ -43,4 +43,4 @@
 
 已安装 Skill 的 `VerifyRemote` 只核对目标与树路径，`safe_readme_present` 只表示 README 路径存在，不是密文字节回读。`LocalView/LocalEdit` 是本人明确操作指定库的本地界面，不是普通备份必经步骤。
 
-`ProtectRemoteReadme` 是另一项需要明确请求的动作：在本地辅助进程读取固定提交的 README、两次本地密码确认、自检后，在同一非强制提交中写密文和替代说明。它不合并已有库，不重写旧历史；`WhatIf` 不读取正文。不得因为只是要上传一份密文，就顺带执行这项正文变更。
+`ProtectRemoteReadme` 是另一项需要明确请求的动作：`WhatIf` 只看 PRIVATE/分支/树路径元数据，不读正文。真实模式固定源提交，只有 README 完整等于受管安全占位文本才认作已保护；若现有 `vault/vault.enc` 已存在而 README 仍是普通正文，则拒绝覆盖密文。写入后必须回读默认分支头、新 README 和新密文并核对 SHA-256 才完整成功。它不合并已有库、不重写旧历史，也不得因为只是上传一份密文就顺带执行正文变更。

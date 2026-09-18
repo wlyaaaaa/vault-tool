@@ -1,50 +1,48 @@
 # vault-tool — 本地文件加密与恢复
 
-把明确选中的文件和子目录加密成一份 `vault.enc`，需要时在本机输入密码，查看、搜索或只提取要用的文件。它是离线文件工具，不是在线保险库、密码找回服务，也不替代 Password Center（密码中心）。
+把明确选择的文件和目录加密为 `vault.enc`，需要时在本机输入密码查看、搜索、导出或维护。它是离线文件工具，不是在线保险库、密码找回服务，也不替代 Password Center（密码中心）。
 
-这份 README 是给人使用和恢复时查阅的说明；代码决定实际行为。本机维护目录为 `E:\Projects\Tools\vault-tool`，版本声明为 2.2.0。公开工具仓库与私人密文仓库 `wlyaaaaa/Key` 分开：工具源码可以公开，真实密码、密钥文件和解密原文不进入公开仓库。
+本机维护目录是 `E:\Projects\Tools\vault-tool`，当前版本 `2.3.0`。公开工具仓库与私人密文仓库 `wlyaaaaa/Key` 分开；密码、密钥文件和解密正文不得进入公开仓库。
 
-## 怎样开始
-
-Windows 安装可用的 Python 后，在工具目录运行：
+## 快速开始
 
 ```powershell
 python vault_tool.py
 ```
 
-菜单提供查看、加密／添加、改密码、旧版升级、备份清理、双密码容器和图片载体。操作错误或取消会回菜单；`[0]`、输入流结束或强制关闭退出。命令行单次操作与持续菜单的退出行为不同。
+密码只在本地提示中输入，不放进聊天、命令行参数、环境变量、脚本、日志或 Git。密钥文件按其完整字节参与派生；密码或必要密钥文件遗失，没有找回机制。
 
-密码只在本机提示中输入；不要放进聊天、命令行参数、环境变量、脚本或日志。使用密钥文件时，恢复需要完全相同的文件字节；密码或必要密钥文件遗失，没有找回机制。
-
-| 要做的事 | 入口 | 实际结果与边界 |
+| 目标 | 入口 | 当前行为 |
 |---|---|---|
-| 给旧库添加文件 | 菜单“加密／添加文件” | 先打开旧库并合并，当前 `source/` 中的同名文件优先；再复制明确的新路径。 |
-| 用当前准备区建一份库 | `encrypt` | 只处理当前 `source/`；不自动合并旧库，已有库会询问覆盖。 |
-| 只看支持的文本 | `decrypt --no-disk` | 在本人本地终端显示，不主动提取文件；明文会进入 stdout，不要由 AI 捕获命令输出。 |
-| 筛选后用外部程序打开附件 | `decrypt` 的交互选项 `[2]` | 输入名称关键词后只提取匹配成员，使用结束清理；强杀可能残留。 |
-| 明确提取本次打开层的全部文件 | `decrypt --extract` | 跳过名称筛选提示，全部提取到 `decrypted/`，不是“只取一个文件”的快捷方式。 |
-| 只看结构、环境和建议 | `info/doctor/assess/plan --json` | 不解密、不列私人文件名、不清理原文，也不执行建议。 |
-| 更换凭据或升级旧库 | `passwd` / `migrate` | 是两个独立操作，先验证原凭据，再重建相应内容。 |
-| 两个密码打开两份内容 | `decoy` | 使用明确诱饵材料；容量不足拒绝，两个密码分别自检。 |
-| 用图片带走密文 | `hide` / `unhide` | 在图片尾部追加／取回密文，不增加一层加密。 |
+| 新建库 | `encrypt` | 加密 `source/`，默认保留原件；`--cleanup-source` 只清理本次已归档且仍完全一致的文件。 |
+| 给已有库追加 | 菜单“加密／添加文件” | 在内存中合并当前密码对应层；未解锁槽位保持密文字节不变，原件保留。 |
+| 改密码 | `passwd` | 只重加密当前解锁的 VAULT03 槽位，保留另一槽与原 KDF。 |
+| 改密钥文件／扩容 | `rebuild --out <new.enc>` | 创建经过读回验证的新副本，原库不替换；可显式输入第二个已知密码以保留两层。 |
+| 旧格式升级 | `migrate` | 独立事务升级；VAULT02 保留原 scrypt 参数，VAULT01 明确改用当前 scrypt。 |
+| 不落盘看文本 | `decrypt --no-disk` | 明文仅用于本地终端显示；stdout 仍属于明文边界，不应由 AI 捕获。 |
+| 导出 | `decrypt` / `decrypt --extract` | 写入明确 `decrypted/`；冲突不覆盖，失败后回执区分真实已写明文与未写明文。 |
+| 结构/计划 | `info` / `doctor` / `assess` / `plan` | 元数据只读；支持 `--vault-file` 精确目标，不回退到默认库。 |
+| 操作预演 | `plan --operation ...` | 返回目标、资源预算、是否会写明文、是否需凭据等元数据，不执行动作。 |
+| 凭据计划 | `credential-plan` | 区分原槽改密、共享密钥文件变化、迁移和重建。 |
+| 恢复环境自测 | `recovery-check --self-test` | 只用虚构密码与内存载荷验证当前运行时，不解密真实库。 |
+| 双密码容器 | `decoy` | 诱饵层与真实层分别验证；容量不足拒绝，原库保留。 |
+| 图片携带密文 | `hide` / `unhide` | 只在图片尾部追加/恢复密文，不增加新加密层。 |
+| 清理残留明文 | `clean-plaintext --confirm` | 独立显式动作；诊断命令不再隐式触发。 |
 
-## 文件入库：追加不等于替换
+## 文件入库与原件保全
 
-引导式添加的顺序：
+当前默认是“先可靠生成并验证密文，再决定是否清理输入”，而不是把删除明文当成加密成功的一部分。
 
-1. 已有库时，先询问是否解开并合并本次密码对应的内容。
-2. 合并时保留当前 `source/` 中的同名新文件；不冲突的旧成员继续加入。
-3. 本人粘贴明确文件／文件夹路径，或直接准备 `source/`。
-4. 设定本次凭据，打包、压缩、加密，并在写入前解开新容器核对预期内容。
-5. 写入密文后清理 `source/`，报告失败或取消，不把文件存在当成成功。
+1. `encrypt` 对 `source/` 建立稳定快照，检查原始路径、链接/重解析点、对象身份、大小与修改时间，并确认读取期间文件没有变化。
+2. 打包后先在内存中验证候选密文，再写同目录临时密文、刷新到磁盘、读回并重新验证，最后提交目标。
+3. 覆盖已有 `vault.enc` 时，旧密文先保存为不会覆盖已有备份的独立恢复副本。
+4. 默认保留 `source/`。只有显式 `--cleanup-source` 才逐文件清理；清理前再次比较对象身份与 SHA-256。并发新增、变化、链接或无法确认的对象全部保留。
+5. 追加文件时，旧库当前层只在内存中展开并与新输入合并，不把旧内容先落到 `source/`。
+6. 新建库会为 gzip 载荷预留有界编辑空间，降低小幅编辑立即撞到固定槽容量的概率；已有库槽位不会静默扩大。
 
-**复制进 `source/` 的原路径文件仍在；直接放进 `source/` 的唯一原件会属于成功后的清理范围。** 该目录是明文暂存，不是长期原件库。合并也会让本次解开的旧内容暂时落到这里。
+需要扩大容量、改变共享密钥文件标志，或重建两密码容器时使用 `rebuild --out`。新副本成功前，原库始终保留。
 
-`python vault_tool.py encrypt` 和 `scripts/Start-KeyVaultEncrypt.ps1` 只加密当前 `source/`，不会自动执行菜单的旧库合并。一个密码只打开相应层；直接重建、合并或改密不能据此保证保留另一个密码对应的全部内容。需要双层保全时先核对具体维护方式并保留可恢复原库。
-
-写入前自检证明内存中新容器能解回预期字节；它不等于磁盘断电一致性、远端备份或恢复机器已经验证。
-
-## 查看、搜索与原文的去向
+## 查看、导出与明文去向
 
 ```powershell
 python vault_tool.py decrypt --no-disk
@@ -52,119 +50,83 @@ python vault_tool.py decrypt
 python vault_tool.py decrypt --extract
 ```
 
-- 普通关键词筛文件名；`/关键词` 搜索文本内容。
-- `:copy 关键词` 复制首个名称匹配的可读文本。CLI（命令行）的清空安排为 20 秒，依赖当前进程仍然存活；它不是系统级定时保证。
-- CLI 支持不超过 64 KiB 的 `.txt .md .csv .log .json .ini .conf .cfg .yaml .yml .py .html .xml .tex` 文本显示。图片、PDF、二进制和更大文件需要明确提取并用对应程序打开。
-- 需要名称筛选时运行不带强制标志的 `decrypt`，选 `[2]` 再输入关键词；`--extract` 跳过这一步并提取全部。声明总解压量超过 4 GiB 会询问是否继续，并非所有操作都被硬限为 4 GiB。
-- 正常结束、部分信号和退出回调会清理 `decrypted/`；强杀、断电可能留下原文。交互菜单及非诊断操作仍会检查并清理旧目录；`info`、`doctor`、`assess`、`plan` 无论是否带 `--json` 都不会触发该清理。
-- Ctrl+X 只在指定等待界面生效，不是全局热键。主缓冲区尽力锁页、清零；Python、归档处理和系统仍可能产生其他副本。
-- 清理前检查精确目标树，遇硬链接、符号链接或重解析点等先拒绝，不顺着链接清理其他文件。SSD 覆写删除不保证物理介质上所有旧副本都消失。
+- CLI 支持小型可读文本直接显示；图片、PDF、二进制和大文件应明确导出后用对应程序打开。
+- `:copy` 的剪贴板清理依赖当前进程存活，不是系统级保证。
+- GUI 查看/编辑把正文限制在本地进程/窗口，不把正文、密钥文件路径或密码返回模型。
+- 导出采用逐文件临时写入、校验、无覆盖提交。已存在且内容相同的文件可视为已恢复；不同内容或并发新建的同名目标保留不覆盖。
+- 如果导出在某文件中途失败，回执仍会如实标记是否已经向磁盘写过明文字节；不能再用“完整文件计数为 0”冒充“没有落盘”。
+- `decrypted/` 的自动清理只属于非诊断交互/使用流程；`info`、`doctor`、`assess`、`plan` 无论文本还是 JSON 输出均不初始化文件日志、不清理原文。
+- SSD 上覆盖删除不能保证物理介质所有历史块消失；“安全删除”只描述当前文件系统对象处理，不作绝对介质承诺。
 
-CLI 的查看、搜索结果会把明文打印到 stdout（标准输出），必须由本人在不被模型捕获的本地终端阅读；“不落盘”不等于“AI 捕获输出也看不到原文”。需要由 AI 调起而只返回状态时，使用已安装 Skill 的明确 `LocalView/LocalEdit` 本地图形入口。
+## 格式、KDF 与资源预算
 
-## 密码、格式与恢复环境
+VAULT03 使用 tar+gzip、AES-256-GCM，以及 scrypt 或可选 Argon2id。密码可以混入密钥文件 SHA-256 摘要作为第二因子。
 
-| 平台／选择 | 依赖 |
-|---|---|
-| Windows 的 scrypt 与 AES | Python 标准库及系统 `bcrypt.dll`，不需第三方加密包。 |
-| Linux / macOS 的 AES | 需要 `cryptography`。 |
-| Argon2id | 另外需要 `argon2-cffi`；明确选择但缺依赖时失败，不改用 scrypt 冒充。 |
+- 默认 scrypt 参数为 `N=2^17, r=8, p=1`；交互新建可校准到约 0.6 秒。
+- Argon2id 需要 `argon2-cffi`。Windows 的 AES/scrypt 使用系统 CNG 和 Python 标准库；Linux/macOS AES 需要 `cryptography`。
+- 在真正运行 KDF 前，容器参数同时检查正值、参数关系、内存和普通工作量预算。合法但异常昂贵的旧库只能在明确 `--allow-expensive-kdf` 恢复选择下尝试，硬内存上限不放宽。
+- 归档成员数、声明解压总量和本地文本大小有独立预算。能识别容器格式不等于任意体积都应整体进内存。
+- VAULT02 是 scrypt + AES-GCM；VAULT01 是 PBKDF2-SHA256 + AES-CBC，兼容读取不等于认证强度相同。
+- 结构检查通过只证明字节布局/参数可接受，不证明密码正确、内容真实或整套恢复已经验收。
 
-VAULT03 使用 tar+gzip、AES-256-GCM（带认证的加密）与 scrypt 或 Argon2id。密码可混入密钥文件摘要；该摘要只用于本地派生，不应展示为公开证据。
+## 改密、迁移、双槽与重建
 
-- 直接封装默认 scrypt `N=2^17, r=8, p=1`；交互新建可校准到约 0.6 秒，上限 `N=2^20`。
-- Argon2id 校准内存上限为 1 GiB；解密参数校验的内存上限为 4 GiB，不是整个进程的总内存上限。
-- 当前容器头保留格式、密钥文件标志与 KDF（密码派生函数）参数；认证还覆盖有关头信息。随机盐为 32 字节、nonce（一次性随机值）为 12 字节、GCM 标签为 16 字节。
-- VAULT02 是 scrypt+AES-GCM；VAULT01 是 PBKDF2-SHA256（600,000 次）与 AES-CBC/PKCS#7。兼容读取不等于具有相同认证特性。
-- 整体打包与处理会持有内存副本；支持任意文件类型不等于已验证任意体积或流式处理。
-
-参数、格式或头部检查通过，不能证明密码正确、内容真实或实际可恢复。认证失败也不能无证据断言一定是密码错还是文件改变。算法名称与强度提示不能换算为本项目已经验证的破解时间、抗量子或绝对保密承诺。
-
-## 改密、升级与旧库
+`passwd` 对 VAULT03 只更新当前密码打开的槽位；未解锁槽位保持原密文字节不变。共享密钥文件标志不能在不知道另一槽凭据的情况下安全地原地修改，因此会引导到 `rebuild`。
 
 ```powershell
-python vault_tool.py passwd
-python vault_tool.py migrate
+python vault_tool.py credential-plan --vault-file <vault.enc> --change keyfile --json
+python vault_tool.py rebuild --out <new.enc>
 ```
 
-- VAULT03 改密和设置诱饵保留原 KDF 标识及全部参数，不把一次改密码顺带变成重新选择算法。
-- VAULT02 升级到 VAULT03 保留原 scrypt 参数。VAULT01 的 PBKDF2 无法直接作为当前 VAULT03 KDF，因此该迁移明确改为当前 scrypt。
-- 结构损坏或原 KDF 不能运行时，在密码提示、备份和写入前停止，原库保持不变，不自动降级。
-- 改密允许本人明确更换／移除密钥文件；另一层是否被保留与 KDF 保留是不同问题。
-- `migrate`、`decoy` 留下 `.enc.bak`；`passwd` 使用临时 `.enc.pwbak`，成功后删除。不能统称每次操作都有长期回退副本。
-- 清理备份需要本人明确确认；它不清除 Git 历史、远端版本或全部系统副本。
+`rebuild` 可只复制当前已验证层，同时保留原库；如果本人同时提供另一个已知密码，则要求它打开不同槽位，再把两层都验证后写入新副本。它不猜测隐藏层是否存在。
 
-## 双密码与图片载体
+`migrate`、`decoy`、`passwd` 和本地编辑均使用统一密文事务：候选验证、临时密文、读回、并发目标检查、提交、最终验证与必要回滚。`migrate` / `decoy` 会保留不会覆盖旧文件的密文恢复副本；`decoy_source/` 默认保留。
 
-### 双密码内容
+双密码只证明软件中的两份内容/密码行为。它不是现实胁迫环境、旧备份、快照或第三方观察下“不可证明存在”的绝对承诺。
 
-`decoy` 让诱饵密码打开主层、真实密码打开尾部层。普通库尾部为填充；公共标志不告诉读者是否存在隐藏层，因此只打开主层不能断定尾部可丢弃。
-
-容器按可见层长度分桶，小库最少 64 KiB；隐藏内容必须放得进对应空间。容量不足拒绝并保留原库，两个密码需分别自检。
-
-这证明的是软件中的内容分工与容量行为，不是现实胁迫、旧备份或多次文件快照下的不可识别保证。
-
-### 图片携带密文
+## AI-safe 元数据与精确目标
 
 ```powershell
-python vault_tool.py hide --cover <封面图片> --out <载体文件>
-python vault_tool.py unhide --in <载体文件> --out <恢复密文>
+python vault_tool.py info --vault-file <vault.enc> --json
+python vault_tool.py doctor --vault-file <vault.enc> --json
+python vault_tool.py assess --vault-file <vault.enc> --json
+python vault_tool.py plan --vault-file <vault.enc> --json
+python vault_tool.py plan --operation decrypt-export --vault-file <vault.enc> --output-path <dir> --json
+python vault_tool.py credential-plan --vault-file <vault.enc> --change password --json
+python vault_tool.py recovery-check --vault-file <vault.enc> --self-test --json
 ```
 
-结构为“封面字节 + 密文 + 8 字节长度 + VLTSTEG1”。这是尾部追加，不是像素级隐写，也不额外加密。默认提取到 `vault.recovered.enc`。
+这些路径不收真实密码、不解密真实库、不列出 `source/` / `decrypted/` 私人文件名，也不执行建议。显式 `--vault-file` 只评估该目标；损坏或不存在的目标不会静默改评默认 `vault.enc`。
 
-取回后比较密文大小和 SHA-256；图片能显示不代表密文还在。图片平台重新编码、压缩或转存可能移除尾部，本项目不保证所有查看器或分享平台兼容。
+已安装的 `vault-workflow` Skill 提供本地 UI 与脱敏 JSON wrapper：
+- `PromptOnly` 只收集并丢弃输入，不打开库。
+- `LocalView` / `LocalEdit` 要求明确 `-VaultFile`。
+- `Encrypt` 保留输入；`DecryptExport` 只写明确输出目录；`ChangePassword` 保留未解锁槽位。
+- CLI、GUI 和 Skill 的改密/导出/编辑共用 `vault_tool.py` 的归档、槽位和事务原语，避免不同入口安全行为漂移。
+- `VerifyPassword` 是一次性本地检查，不建立可复用授权会话。
 
-## AI 元数据与本地图形入口
+## 私人 Key 仓库
 
-```powershell
-python vault_tool.py info --json
-python vault_tool.py doctor --json
-python vault_tool.py assess --json
-python vault_tool.py plan --json
-```
+见 [Key 仓库工作流](docs/key-repository-workflow.md)。
 
-`info`、`doctor`、`assess`、`plan` 都不因查询而初始化文件日志或清理原文，输出格式不改变副作用。`--json` 提供不收密码、不解密、不列 `source/` 或 `decrypted/` 内文件名、不执行建议的结构化元数据，供自动化读取。
+`Publish-KeyVaultToGitHub.ps1` 只向现场确认 PRIVATE 的目标发布明确密文；`-WhatIf` 在真正创建本地请求临时文件之前返回预演结果。真实写入后从默认分支读回 Git blob，并比较远端字节数与 SHA-256；只有上传和字节回读都成立才报告 `upload_performed=true`、`readback_verified=true`。
 
-损坏的已知格式也进入 `manual_review`，不能因有 `source/` 就推荐加密覆盖。元数据查询正常完成可以 exit 0；调用方必须读取库的 `ok`、风险与 `decision`，不能把查询成功当库健康。可见 CLI 操作失败返回 1，参数错误返回 2，中断返回 130。
+`ProtectRemoteReadme` 与普通发布分开：
+- `WhatIf` 只读仓库/分支/树路径元数据，不读 README 正文。
+- 只有 README 字节完整等于受管安全占位文本，才认定“已经保护”；仅包含 marker 不算。
+- 如果 `vault/vault.enc` 已存在而 README 仍是普通正文，拒绝覆盖既有密文。
+- 真正变更后回读默认分支头、README 和密文，并核对密文 SHA-256；读回失败时保留真实 effect 字段，但 `ok=false` / `readback_verified=false`。
+- 不重写旧 Git 历史。
 
-本机另有已安装的 `vault-workflow` Skill，由它自己的来源维护，并不随这个公开仓库自动安装：
-
-- `PromptOnly` 只收集并丢弃本地输入，不验证密码、不寻找或打开库。
-- `LocalView`／`LocalEdit` 要求明确 `-VaultFile`；不自动在 Key、旧目录或当前目录之间寻找库。
-- 需要密钥文件时先选文件再解密。`Required` 拒绝原本没有绑定密钥文件的库，不以随便选个文件制造“已验证双因子”。
-- 查看／编辑只在本地界面处理原文；保存保留未编辑成员、二进制、必要属性、原凭据与 KDF，以及未解锁槽位。
-- 只编辑受支持的 gzip tar 中 UTF-8 文本。压缩后内容必须容纳在原加密槽内，容量不是字数；不支持的属性、格式或超容量时拒绝，原密文不变。
-- 新密文自检、原子替换与失败回退分别核对；结果区分 `saved`、未变化、未保存关闭与取消，不把关闭窗口说成保存。
-- GUI（图形界面）的复制清理为 15 秒及关闭时清理，与 CLI 的 20 秒安排不同；未进行真实桌面输入试验时不能用替身测试冒充。
-
-完整命令与 JSON 字段以已安装 Skill 的当前合同为准。不要为了检查文件而启动会读取实际原文的本地模式。
-
-## 私人密文备份
-
-见 [Key 仓库工作流](docs/key-repository-workflow.md)。发布脚本只向现场确认为 PRIVATE（私有）的目标上传，不克隆 Key，不创建定时任务：
+## 验证边界
 
 ```powershell
-scripts/Publish-KeyVaultToGitHub.ps1 -VaultFile <明确密文> -WhatIf
-```
-
-真实发布先核对默认分支及已有路径，只有真实 404 才按新建处理。PUT 失败即报错；成功后从默认分支读取对应 blob（Git 文件内容对象），比较远端字节长度与本次上传缓冲区的 SHA-256。只有两步都通过才返回 `upload_performed=true` 和 `readback_verified=true`。
-
-`WhatIf` 不上传，两字段为 false。真实写入后回读失败，可能已经改变远端，应先核对而不是盲目重试。扩展名许可不是加密证明，密文读回也不是密码恢复验收。
-
-Skill 的 `VerifyRemote` 只做目标与树路径检查；`safe_readme_present` 只表示 README 路径存在，不证明正文是安全占位说明。另一个 `ProtectRemoteReadme` 动作由本地辅助进程读取固定提交的正文，要求两次本地密码一致，自检后用同一个非强制提交写密文与替代说明；它不改写旧历史，也不合并现有保险库。只预演时不读取正文。
-
-## 验证和本轮证据边界
-
-```powershell
-python -m pytest test_vault_tool.py test_readonly_diagnostics.py -v -rA -p no:cacheprovider
+python -m pytest test_vault_tool.py test_readonly_diagnostics.py test_recovery_regressions.py -q -p no:cacheprovider
 pwsh -NoProfile -File scripts/Test-Publish-KeyVaultToGitHub.ps1
 ```
 
-测试使用虚构文件和隔离临时目录；剪贴板测试使用替身，不触碰系统剪贴板。2026-09-03 的来源回归为 106 个测试、13 个子用例通过；交互、V1 迁移选择和部分系统行为含受控替身，不能冒充真实桌面／断电验收。
+2026-09-18 的正式核心回归使用虚构文件、虚构密码和隔离临时目录：**126 项测试、28 项子用例通过**。新增覆盖包括双槽改密/合并保全、默认原件保留与精确快照清理、事务写回/回滚、并发目标、导出回执、KDF 工作预算、精确目标计划、凭据计划、恢复环境虚构自测、非覆盖备份和双层新副本重建。
 
-另有真实 Windows CNG、未替换 KDF/AES 的虚构样例，验证正常往返、错误输入、同名合并、选择性提取、V2 迁移、双密码、图片载体和原参数保留。小参数测试用来检验“参数是否原样保留”，不是推荐真实数据采用这些测试参数。
+`vault-workflow` 另有本地操作、GUI/事务、wrapper 与远端保护虚构测试；`authorization-file-broker` 另有批量往返、续作、PCAF UI、并发冲突和原审计缺陷回归。最终验收分别看来源测试、Skill smoke、PCConfig 验证器和 Git 默认分支回读，不能互相替代。
 
-发布脚本测试通过模拟 gh 执行真实脚本入口，不访问私人远端。本轮没有读或改本人真实库、密码、密钥文件或私人 Key 正文，没有真实私人上传、强杀／断电或干净新机恢复结论。
-
-2026-09-18 诊断只读修复回归：107 项测试、21 项子用例通过；新增测试覆盖四种诊断命令的文本/JSON 两种输出形式，均不调用日志初始化或原文清理。该结果不代表其余审计整改、真实凭据恢复或整体发布验收完成。
+本轮没有读取或修改真实保险库密码、密钥文件或解密正文，也没有为了测试而改真实私人 Key README/密文。强杀、断电和全新机器上的真人凭据恢复属于物理/人工环境验收，不由虚构回归冒充。
