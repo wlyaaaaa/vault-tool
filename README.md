@@ -56,7 +56,7 @@ python vault_tool.py decrypt --extract
 - `:copy 关键词` 复制首个名称匹配的可读文本。CLI（命令行）的清空安排为 20 秒，依赖当前进程仍然存活；它不是系统级定时保证。
 - CLI 支持不超过 64 KiB 的 `.txt .md .csv .log .json .ini .conf .cfg .yaml .yml .py .html .xml .tex` 文本显示。图片、PDF、二进制和更大文件需要明确提取并用对应程序打开。
 - 需要名称筛选时运行不带强制标志的 `decrypt`，选 `[2]` 再输入关键词；`--extract` 跳过这一步并提取全部。声明总解压量超过 4 GiB 会询问是否继续，并非所有操作都被硬限为 4 GiB。
-- 正常结束、部分信号和退出回调会清理 `decrypted/`；强杀、断电可能留下原文。下次**非 JSON** 启动会检查并清理旧目录。
+- 正常结束、部分信号和退出回调会清理 `decrypted/`；强杀、断电可能留下原文。交互菜单及非诊断操作仍会检查并清理旧目录；`info`、`doctor`、`assess`、`plan` 无论是否带 `--json` 都不会触发该清理。
 - Ctrl+X 只在指定等待界面生效，不是全局热键。主缓冲区尽力锁页、清零；Python、归档处理和系统仍可能产生其他副本。
 - 清理前检查精确目标树，遇硬链接、符号链接或重解析点等先拒绝，不顺着链接清理其他文件。SSD 覆写删除不保证物理介质上所有旧副本都消失。
 
@@ -124,7 +124,7 @@ python vault_tool.py assess --json
 python vault_tool.py plan --json
 ```
 
-只有带 `--json` 的这些模式是严格元数据路径：不收密码、不解密、不列 `source/` 或 `decrypted/` 内的文件名、不执行建议。非 JSON 同名命令会初始化日志并走旧原文清理。
+`info`、`doctor`、`assess`、`plan` 都不因查询而初始化文件日志或清理原文，输出格式不改变副作用。`--json` 提供不收密码、不解密、不列 `source/` 或 `decrypted/` 内文件名、不执行建议的结构化元数据，供自动化读取。
 
 损坏的已知格式也进入 `manual_review`，不能因有 `source/` 就推荐加密覆盖。元数据查询正常完成可以 exit 0；调用方必须读取库的 `ok`、风险与 `decision`，不能把查询成功当库健康。可见 CLI 操作失败返回 1，参数错误返回 2，中断返回 130。
 
@@ -157,7 +157,7 @@ Skill 的 `VerifyRemote` 只做目标与树路径检查；`safe_readme_present` 
 ## 验证和本轮证据边界
 
 ```powershell
-python -m pytest test_vault_tool.py -v -rA -p no:cacheprovider
+python -m pytest test_vault_tool.py test_readonly_diagnostics.py -v -rA -p no:cacheprovider
 pwsh -NoProfile -File scripts/Test-Publish-KeyVaultToGitHub.ps1
 ```
 
@@ -166,3 +166,5 @@ pwsh -NoProfile -File scripts/Test-Publish-KeyVaultToGitHub.ps1
 另有真实 Windows CNG、未替换 KDF/AES 的虚构样例，验证正常往返、错误输入、同名合并、选择性提取、V2 迁移、双密码、图片载体和原参数保留。小参数测试用来检验“参数是否原样保留”，不是推荐真实数据采用这些测试参数。
 
 发布脚本测试通过模拟 gh 执行真实脚本入口，不访问私人远端。本轮没有读或改本人真实库、密码、密钥文件或私人 Key 正文，没有真实私人上传、强杀／断电或干净新机恢复结论。
+
+2026-09-18 诊断只读修复回归：107 项测试、21 项子用例通过；新增测试覆盖四种诊断命令的文本/JSON 两种输出形式，均不调用日志初始化或原文清理。该结果不代表其余审计整改、真实凭据恢复或整体发布验收完成。

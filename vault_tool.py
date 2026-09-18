@@ -2788,8 +2788,11 @@ def main(argv=None):
     _NO_COLOR_FLAG = args.no_color
     _init_colors()
 
+    # Formatting never changes the side effects of diagnostic commands.
+    metadata_only = args.command in {"info", "doctor", "assess", "plan"}
     if not json_mode:
         print()
+    if not metadata_only:
         _setup_logging()
         _cleanup_stale_plaintext()
 
