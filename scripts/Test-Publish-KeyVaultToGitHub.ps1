@@ -7,7 +7,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $publishScript = Join-Path $PSScriptRoot 'Publish-KeyVaultToGitHub.ps1'
-$tempRoot = 'E:\Cache\Codex\Temp\wly-vault18-publish-tests'
+$tempRoot = [IO.Path]::GetTempPath()
 $runRoot = Join-Path $tempRoot ('run-' + [Guid]::NewGuid().ToString('N'))
 $oldTemp = $env:TEMP
 $oldTmp = $env:TMP

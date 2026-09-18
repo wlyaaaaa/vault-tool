@@ -19,7 +19,7 @@
    请使用足够长的口令（建议 6+ 随机单词，或 16+ 位随机串）。
 """
 
-__version__ = "2.3.0"
+__version__ = "2.3.1"
 
 import os
 import tempfile
@@ -1809,7 +1809,7 @@ def _view_in_memory(plaintext):
         os._exit(2)
 
     with tarfile.open(fileobj=io.BytesIO(bytes(plaintext)), mode="r") as tar:
-        members = [m for m in tar.getmembers() if m.isfile()]
+        members = [m for m in _bounded_members(tar) if m.isfile()]
         text_ok = {m.name: (Path(m.name).suffix.lower() in TEXT_EXT
                             and m.size <= TEXT_PRINT_LIMIT) for m in members}
         print(f"共 {_c(str(len(members)), _BOLD)} 个文件。")
@@ -2941,15 +2941,71 @@ def _hash_file(path):
     return digest.hexdigest()
 
 
+def _delete_archived_file(path, identity, expected_digest):
+    """Verify and remove one archived Windows file under an exclusive handle.
+
+    This is logical deletion, not a physical-media wiping claim. If the host
+    cannot guarantee exclusive handle deletion, keep the original instead.
+    """
+    path = _reject_reparse_chain(path)
+    if os.name != 'nt':
+        raise VaultOperationError('snapshot_cleanup_exclusive_delete_unavailable')
+    import msvcrt
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                  ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.SetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                                  ctypes.c_void_p, wintypes.DWORD]
+    kernel.SetFileInformationByHandle.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    # GENERIC_READ | DELETE; sharing=0; OPEN_EXISTING; open the reparse object
+    # itself if the final component was replaced between lexical checks.
+    handle = kernel.CreateFileW(str(path), 0x80010000, 0, None, 3, 0x00200000, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    transferred = False
+    try:
+        descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+        transferred = True  # The descriptor now owns the Windows handle.
+        try:
+            stream = os.fdopen(descriptor, 'rb')
+        except BaseException:
+            os.close(descriptor)
+            raise
+        with stream:
+            opened = os.fstat(stream.fileno())
+            actual = (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_nlink,
+                      opened.st_size, opened.st_mtime_ns)
+            if actual != identity or opened.st_nlink != 1 or not stat.S_ISREG(opened.st_mode):
+                raise VaultOperationError('source_changed')
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                digest.update(chunk)
+            after = os.fstat(stream.fileno())
+            if (after.st_dev, after.st_ino, after.st_mode, after.st_nlink,
+                after.st_size, after.st_mtime_ns) != identity or digest.hexdigest() != expected_digest:
+                raise VaultOperationError('source_changed')
+            class Disposition(ctypes.Structure):
+                _fields_ = [('DeleteFile', ctypes.c_ubyte)]
+            disposition = Disposition(1)
+            if not kernel.SetFileInformationByHandle(handle, 4, ctypes.byref(disposition), ctypes.sizeof(disposition)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            # Deletion occurs when this exclusively held handle closes. Never
+            # call path.unlink() after releasing it: a new pathname may exist.
+    finally:
+        if not transferred:
+            kernel.CloseHandle(handle)
+
+
 def cleanup_archived_snapshot(snapshots):
-    """Delete only archived, still-identical regular files; never rescan-delete a tree."""
+    """Delete only authenticated archived objects; preserve busy/changed inputs."""
     preserved = []
     for path, identity, digest in snapshots:
         try:
-            if _file_snapshot(path) != identity or _hash_file(path) != digest:
-                preserved.append(path)
-                continue
-            secure_delete(path, _expected_identity=identity[:5])
+            _delete_archived_file(path, identity, digest)
         except (OSError, ValueError, RuntimeError):
             preserved.append(path)
     return preserved
@@ -3239,6 +3295,8 @@ def collect_operation_plan(operation, vault_file=None, inputs=None, output_path=
               'source_files_preserved': True, 'credentials_verified': False,
               'content_verified': False, 'target_validated': False,
               'planned': True, 'errors': [], 'input_count': 0, 'input_bytes': 0,
+               'validation_scope': 'metadata_paths_and_resource_budget',
+               'execution_requires_revalidation': True, 'input_entries': 0,
               'resource_limits': {'archive_bytes': MAX_ARCHIVE_BYTES, 'archive_members': MAX_ARCHIVE_MEMBERS,
                                   'local_text_bytes': MAX_LOCAL_TEXT_BYTES},
               'other_slot_policy': 'preserve_opaque' if operation in ('change-password', 'local-edit') else 'original_preserved_in_new_copy' if operation == 'rebuild' else 'not_applicable'}
@@ -3285,6 +3343,8 @@ def collect_operation_plan(operation, vault_file=None, inputs=None, output_path=
                     while pending:
                         item = pending.pop()
                         _reject_reparse_chain(item)
+                        _safe_member_name(item.relative_to(root.parent).as_posix())
+                        result['input_entries'] += 1
                         if item.is_dir():
                             pending.extend(item.iterdir())
                         elif item.is_file():
@@ -3292,8 +3352,22 @@ def collect_operation_plan(operation, vault_file=None, inputs=None, output_path=
                             result['input_bytes'] += item.stat().st_size
                         else:
                             raise VaultOperationError('special_entry_rejected')
-                        if result['input_count'] > MAX_ARCHIVE_MEMBERS or result['input_bytes'] > MAX_ARCHIVE_BYTES:
+                        if result['input_entries'] > MAX_ARCHIVE_MEMBERS or result['input_bytes'] > MAX_ARCHIVE_BYTES:
                             raise VaultOperationError('archive_budget_exceeded')
+            except (ValueError, OSError) as exc:
+                result['errors'].append(getattr(exc, 'code', 'input_path_unavailable'))
+    if operation in ('hide', 'unhide'):
+        if not inputs or len(inputs) != 1:
+            result['errors'].append('exact_cover_or_carrier_required')
+        else:
+            try:
+                selected = _reject_reparse_chain(inputs[0])
+                if not selected.is_file():
+                    raise VaultOperationError('input_path_unavailable')
+                result['input_count'] = result['input_entries'] = 1
+                result['input_bytes'] = selected.stat().st_size
+                if result['input_bytes'] > MAX_ARCHIVE_BYTES:
+                    raise VaultOperationError('archive_budget_exceeded')
             except (ValueError, OSError) as exc:
                 result['errors'].append(getattr(exc, 'code', 'input_path_unavailable'))
     result['ok'] = not result['errors']
@@ -3369,15 +3443,15 @@ def collect_recovery_check(vault_file=None, self_test=False):
 
 def rebuild_mode(output_path, keyfile_path=None, added_inputs=None):
     """Create an explicitly selected credential/capacity copy, never replace its source."""
-    original = VAULT_FILE.read_bytes()
-    output = _reject_reparse_chain(output_path)
-    if output.exists() or not output.parent.is_dir():
-        _err('需要新的、父目录存在的输出文件。')
-        return False
-    old_key = _prompt_keyfile_for_decrypt(original, keyfile_path)
-    _pw, first, first_layer = _get_password_with_retry('原库密码：', original, old_key)
-    second = None
+    first = second = None
     try:
+        original = VAULT_FILE.read_bytes()
+        output = _reject_reparse_chain(output_path)
+        if output.exists() or not output.parent.is_dir():
+            _err('需要新的、父目录存在的输出文件。')
+            return False
+        old_key = _prompt_keyfile_for_decrypt(original, keyfile_path)
+        _pw, first, first_layer = _get_password_with_retry('原库密码：', original, old_key)
         _info('原库始终保留。只迁移本次已打开的内容时，未打开内容仍只在原库。')
         second_password = getpass('同时保留另一个已知密码对应内容时输入该密码；否则直接回车：') if original[:7] == MAGIC_V3 else ''
         if second_password:
@@ -3411,6 +3485,7 @@ def rebuild_mode(output_path, keyfile_path=None, added_inputs=None):
         kdf = _preserved_kdf_for_rewrite(metadata) or _get_kdf_params()
         checks = []
         if second is None:
+            payload = reserve_edit_capacity(payload)
             candidate = _pack_vault_v3(new_password, payload, keyfile_hash=new_key, kdf=kdf)
             checks.append((new_password, 0, payload))
         else:
@@ -3419,6 +3494,7 @@ def rebuild_mode(output_path, keyfile_path=None, added_inputs=None):
                 raise VaultOperationError('distinct_passwords_required')
             visible, hidden = (payload, bytes(second)) if first_layer == 0 else (bytes(second), payload)
             visible_password, hidden_password = (new_password, new_second_password) if first_layer == 0 else (new_second_password, new_password)
+            visible = reserve_edit_capacity(visible)
             # Padding is inside the visible gzip slot; no archive member is fabricated.
             while _bucket_size(93 + len(visible)) - (93 + len(visible)) - 68 < len(hidden):
                 if not visible.startswith(b'\x1f\x8b'):

@@ -2,7 +2,7 @@
 
 把明确选择的文件和目录加密为 `vault.enc`，需要时在本机输入密码查看、搜索、导出或维护。它是离线文件工具，不是在线保险库、密码找回服务，也不替代 Password Center（密码中心）。
 
-本机维护目录是 `E:\Projects\Tools\vault-tool`，当前版本 `2.3.0`。公开工具仓库与私人密文仓库 `wlyaaaaa/Key` 分开；密码、密钥文件和解密正文不得进入公开仓库。
+本机维护目录是 `E:\Projects\Tools\vault-tool`，当前版本 `2.3.1`。公开工具仓库与私人密文仓库 `wlyaaaaa/Key` 分开；密码、密钥文件和解密正文不得进入公开仓库。
 
 ## 快速开始
 
@@ -20,7 +20,7 @@ python vault_tool.py
 | 改密钥文件／扩容 | `rebuild --out <new.enc>` | 创建经过读回验证的新副本，原库不替换；可显式输入第二个已知密码以保留两层。 |
 | 旧格式升级 | `migrate` | 独立事务升级；VAULT02 保留原 scrypt 参数，VAULT01 明确改用当前 scrypt。 |
 | 不落盘看文本 | `decrypt --no-disk` | 明文仅用于本地终端显示；stdout 仍属于明文边界，不应由 AI 捕获。 |
-| 导出 | `decrypt` / `decrypt --extract` | 写入明确 `decrypted/`；冲突不覆盖，失败后回执区分真实已写明文与未写明文。 |
+| 导出 | `decrypt` / `decrypt --extract` | 写入明确 `decrypted/`；冲突不覆盖；部分导出返回 `ok=false, result=partial` 和分类计数，回执保留实际写入事实。 |
 | 结构/计划 | `info` / `doctor` / `assess` / `plan` | 元数据只读；支持 `--vault-file` 精确目标，不回退到默认库。 |
 | 操作预演 | `plan --operation ...` | 返回目标、资源预算、是否会写明文、是否需凭据等元数据，不执行动作。 |
 | 凭据计划 | `credential-plan` | 区分原槽改密、共享密钥文件变化、迁移和重建。 |
@@ -36,7 +36,7 @@ python vault_tool.py
 1. `encrypt` 对 `source/` 建立稳定快照，检查原始路径、链接/重解析点、对象身份、大小与修改时间，并确认读取期间文件没有变化。
 2. 打包后先在内存中验证候选密文，再写同目录临时密文、刷新到磁盘、读回并重新验证，最后提交目标。
 3. 覆盖已有 `vault.enc` 时，旧密文先保存为不会覆盖已有备份的独立恢复副本。
-4. 默认保留 `source/`。只有显式 `--cleanup-source` 才逐文件清理；清理前再次比较对象身份与 SHA-256。并发新增、变化、链接或无法确认的对象全部保留。
+4. 默认保留 `source/`。只有显式 `--cleanup-source` 才逐文件清理；Windows 清理在同一个独占句柄中比较对象身份与 SHA-256，并由同一句柄完成逻辑删除；新增、变化、正在被使用、硬链接或无法确认的对象全部保留。不具备这一独占删除实现的平台会保留原件，不退回存在竞态的覆写删除。
 5. 追加文件时，旧库当前层只在内存中展开并与新输入合并，不把旧内容先落到 `source/`。
 6. 新建库会为 gzip 载荷预留有界编辑空间，降低小幅编辑立即撞到固定槽容量的概率；已有库槽位不会静默扩大。
 
@@ -53,9 +53,9 @@ python vault_tool.py decrypt --extract
 - CLI 支持小型可读文本直接显示；图片、PDF、二进制和大文件应明确导出后用对应程序打开。
 - `:copy` 的剪贴板清理依赖当前进程存活，不是系统级保证。
 - GUI 查看/编辑把正文限制在本地进程/窗口，不把正文、密钥文件路径或密码返回模型。
-- 导出采用逐文件临时写入、校验、无覆盖提交。已存在且内容相同的文件可视为已恢复；不同内容或并发新建的同名目标保留不覆盖。
+- 导出采用逐文件临时写入、校验、无覆盖提交。已存在且内容相同的文件计入 `already_count`；不同内容或并发新建的同名目标计入 `conflict_count`。存在冲突或不支持成员时返回部分完成，不冒称全部成功。
 - 如果导出在某文件中途失败，回执仍会如实标记是否已经向磁盘写过明文字节；不能再用“完整文件计数为 0”冒充“没有落盘”。
-- `decrypted/` 的自动清理只属于非诊断交互/使用流程；`info`、`doctor`、`assess`、`plan` 无论文本还是 JSON 输出均不初始化文件日志、不清理原文。
+- 本次交互导出结束可清理本次输出；旧残留使用独立的 `clean-plaintext --confirm`。诊断和普通启动不顺带清除旧目录，文本/JSON 输出不改变这一点。
 - SSD 上覆盖删除不能保证物理介质所有历史块消失；“安全删除”只描述当前文件系统对象处理，不作绝对介质承诺。
 
 ## 格式、KDF 与资源预算
@@ -113,20 +113,26 @@ python vault_tool.py recovery-check --vault-file <vault.enc> --self-test --json
 
 `ProtectRemoteReadme` 与普通发布分开：
 - `WhatIf` 只读仓库/分支/树路径元数据，不读 README 正文。
-- 只有 README 字节完整等于受管安全占位文本，才认定“已经保护”；仅包含 marker 不算。
+- 只有 README 字节完整等于受管安全占位文本，才认定“已经保护”；仅包含 marker 不算。此路径返回 `existing_stub_verified`，不声称验证过既有密文或密码。
 - 如果 `vault/vault.enc` 已存在而 README 仍是普通正文，拒绝覆盖既有密文。
-- 真正变更后回读默认分支头、README 和密文，并核对密文 SHA-256；读回失败时保留真实 effect 字段，但 `ok=false` / `readback_verified=false`。
+- 真正变更前重新核对仓库私有性和固定提交的完整树，截断的树不能证明文件不存在。变更后回读分支头、README 和密文，并核对 SHA-256；若更新响应丢失则只回读、不盲目重复写，仍不能确定时 effect 为 `null`，而不是误报“没有修改”。Base64 正常换行和较大文件的固定 blob 回读均受支持。
 - 不重写旧 Git 历史。
 
 ## 验证边界
 
 ```powershell
-python -m pytest test_vault_tool.py test_readonly_diagnostics.py test_recovery_regressions.py -q -p no:cacheprovider
+python -m pytest test_vault_tool.py test_readonly_diagnostics.py test_recovery_regressions.py test_final_audit.py -q -p no:cacheprovider
 pwsh -NoProfile -File scripts/Test-Publish-KeyVaultToGitHub.ps1
 ```
 
-2026-09-18 的正式核心回归使用虚构文件、虚构密码和隔离临时目录：**126 项测试、28 项子用例通过**。新增覆盖包括双槽改密/合并保全、默认原件保留与精确快照清理、事务写回/回滚、并发目标、导出回执、KDF 工作预算、精确目标计划、凭据计划、恢复环境虚构自测、非覆盖备份和双层新副本重建。
+2026-09-18 的正式核心回归使用虚构文件、虚构密码和隔离临时目录：**137 项测试、30 项子用例通过**。新增覆盖包括双槽改密/合并保全、默认原件保留与精确快照清理、事务写回/回滚、并发目标、导出回执、KDF 工作预算、精确目标计划、凭据计划、恢复环境虚构自测、非覆盖备份和双层新副本重建。
 
 `vault-workflow` 另有本地操作、GUI/事务、wrapper 与远端保护虚构测试；`authorization-file-broker` 另有批量往返、续作、PCAF UI、并发冲突和原审计缺陷回归。最终验收分别看来源测试、Skill smoke、PCConfig 验证器和 Git 默认分支回读，不能互相替代。
 
 本轮没有读取或修改真实保险库密码、密钥文件或解密正文，也没有为了测试而改真实私人 Key README/密文。强杀、断电和全新机器上的真人凭据恢复属于物理/人工环境验收，不由虚构回归冒充。
+
+## 2.3.1 最终复核
+
+本次复核补齐了 2.3.0 尚未覆盖的实际缺口：受保护 PCAF 安装同步、GitHub 正常换行解码、固定源树与丢失响应处理、编辑器归档/文本资源预算、部分导出的真实回执，以及清理原件的独占句柄保护。新库的编辑余量现在同时用于 CLI、Skill 新建和重建；编辑窗口显示当前槽容量。
+
+验收分别记录源码回归、已安装 Skill、PCAF 固定解释器与安装文件/清单一致性、远端只读预演和默认分支发布回读。测试计数按不同用例去重，不把聚合 runner 再次运行的用例重复相加。真实密码、私人解密正文、物理断电和新机器恢复没有被冒称为本轮已实测；工程验收也不声称密码学或软件绝对无缺陷。
