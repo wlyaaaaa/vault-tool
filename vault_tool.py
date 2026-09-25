@@ -2819,16 +2819,86 @@ class VaultOperationError(ValueError):
         self.residual_count = residual_count
 
 
+# PCConfig registers the few encrypted-vault mount points and junctions it
+# created and verified (for example E:\PersonalData).  The file is absent until
+# PCConfig attaches the vault; without it every reparse point stays rejected.
+PERSONAL_VAULT_LINKS_REGISTRY = Path(r"C:\ProgramData\PCConfig\PersonalVault\vault-links.json")
+PERSONAL_VAULT_LINKS_SCHEMA = 'pcconfig.personal-vault-links.v1'
+IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003
+
+
+def _strip_extended_prefix(value):
+    return value[4:] if value.startswith('\\\\?\\') else value
+
+
+def _vault_link_path_key(value):
+    return os.path.normcase(os.path.abspath(_strip_extended_prefix(value)))
+
+
+def _vault_link_target_key(value):
+    return os.path.normcase(_strip_extended_prefix(value))
+
+
+def _load_trusted_vault_links():
+    """Return {normalised path: normalised target}, or None when unusable."""
+    try:
+        document = json.loads(Path(PERSONAL_VAULT_LINKS_REGISTRY).read_bytes().decode('utf-8-sig'))
+        if not isinstance(document, dict) or document.get('schema') != PERSONAL_VAULT_LINKS_SCHEMA:
+            return None
+        links = document.get('links')
+        if not isinstance(links, list):
+            return None
+        trusted = {}
+        for entry in links:
+            if not isinstance(entry, dict):
+                return None
+            link_path, target = entry.get('path'), entry.get('target')
+            if not isinstance(link_path, str) or not isinstance(target, str) or not link_path or not target:
+                return None
+            if not os.path.isabs(_strip_extended_prefix(link_path)):
+                return None
+            key, value = _vault_link_path_key(link_path), _vault_link_target_key(target)
+            if trusted.get(key, value) != value:
+                return None
+            trusted[key] = value
+        return trusted
+    except Exception:
+        return None
+
+
+def _is_trusted_vault_link(part, info, trusted):
+    """A registered mount point/junction (never a symlink) whose target matches."""
+    if not _IS_WINDOWS or not trusted or stat.S_ISLNK(info.st_mode):
+        return False
+    if getattr(info, 'st_reparse_tag', None) != IO_REPARSE_TAG_MOUNT_POINT:
+        return False
+    try:
+        expected = trusted.get(_vault_link_path_key(os.fspath(part)))
+        return expected is not None and _vault_link_target_key(os.readlink(part)) == expected
+    except Exception:
+        return False
+
+
 def _reject_reparse_chain(path):
-    """Check the original lexical path before resolve() discards link identity."""
+    """Check the original lexical path before resolve() discards link identity.
+
+    Only PCConfig-registered vault links whose actual target matches are
+    allowed; every component below them is still checked on its own.
+    """
     path = Path(os.path.abspath(os.fspath(path)))
+    trusted = None
     for part in (path, *path.parents):
         try:
             info = part.lstat()
         except FileNotFoundError:
             continue
-        if stat.S_ISLNK(info.st_mode) or _is_reparse_point(info):
+        if stat.S_ISLNK(info.st_mode):
             raise VaultOperationError('reparse_point_rejected')
+        if _is_reparse_point(info):
+            if trusted is None:
+                trusted = _load_trusted_vault_links() or {}
+            if not _is_trusted_vault_link(part, info, trusted):
+                raise VaultOperationError('reparse_point_rejected')
     return path
 
 

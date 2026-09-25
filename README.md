@@ -33,7 +33,7 @@ python vault_tool.py
 
 当前默认是“先可靠生成并验证密文，再决定是否清理输入”，而不是把删除明文当成加密成功的一部分。
 
-1. `encrypt` 对 `source/` 建立稳定快照，检查原始路径、链接/重解析点、对象身份、大小与修改时间，并确认读取期间文件没有变化。
+1. `encrypt` 对 `source/` 建立稳定快照，检查原始路径、链接/重解析点、对象身份、大小与修改时间，并确认读取期间文件没有变化。路径上只放行 PCConfig 在 `C:\ProgramData\PCConfig\PersonalVault\vault-links.json` 登记、实际为挂载点/联接且目标一致的加密盘根；登记表缺失或无效、未登记、目标不符或符号链接一律拒绝，可信根以下仍逐级检查。
 2. 打包后先在内存中验证候选密文，再写同目录临时密文、刷新到磁盘、读回并重新验证，最后提交目标。
 3. 覆盖已有 `vault.enc` 时，旧密文先保存为不会覆盖已有备份的独立恢复副本。
 4. 默认保留 `source/`。只有显式 `--cleanup-source` 才逐文件清理；Windows 清理在同一个独占句柄中比较对象身份与 SHA-256，并由同一句柄完成逻辑删除；新增、变化、正在被使用、硬链接或无法确认的对象全部保留。不具备这一独占删除实现的平台会保留原件，不退回存在竞态的覆写删除。
@@ -121,7 +121,7 @@ python vault_tool.py recovery-check --vault-file <vault.enc> --self-test --json
 ## 验证边界
 
 ```powershell
-python -m pytest test_vault_tool.py test_readonly_diagnostics.py test_recovery_regressions.py test_final_audit.py -q -p no:cacheprovider
+python -m pytest test_vault_tool.py test_readonly_diagnostics.py test_recovery_regressions.py test_final_audit.py test_vault_links.py -q -p no:cacheprovider
 pwsh -NoProfile -File scripts/Test-Publish-KeyVaultToGitHub.ps1
 ```
 
