@@ -1,7 +1,7 @@
 """
 保险库工具 - vault_tool.py
 
-加密：source/ 下任意文件（含子目录）-> vault.enc，安全删除原文
+加密：source/ 下任意文件（含子目录）-> vault.enc，默认保留原件
 解密：vault.enc -> 终端显示（不落盘）或 decrypted/（阅后安全删除）
 
 加密方案（VAULT03，Windows 零第三方依赖）：
@@ -2115,7 +2115,7 @@ def hide_in_image(cover_path, payload_path, out_path):
     cover = Path(cover_path).read_bytes()
     payload = Path(payload_path).read_bytes()
     blob = cover + payload + struct.pack(">Q", len(payload)) + STEG_MAGIC
-    Path(out_path).write_bytes(blob)
+    _publish_new_stego_output(out_path, blob)
     return len(payload), len(blob)
 
 
@@ -2129,8 +2129,22 @@ def extract_from_image(stego_path, out_path):
     if start < 0:
         raise ValueError("隐写数据长度异常，文件可能已损坏。")
     payload = data[start:-16]
-    Path(out_path).write_bytes(payload)
+    _publish_new_stego_output(out_path, payload)
     return len(payload)
+
+
+def _publish_new_stego_output(out_path, blob):
+    """Stage a complete output, then publish it without replacing an old file."""
+    out = _reject_reparse_chain(out_path)
+    if out.exists():
+        raise FileExistsError(f"输出文件已存在：{out}")
+    candidate = _write_ciphertext_temp(out, '.stego-pending', blob)
+    try:
+        if candidate.read_bytes() != blob:
+            raise VaultOperationError('stego_candidate_readback_failed')
+        publish_no_replace(candidate, out)
+    finally:
+        candidate.unlink(missing_ok=True)
 
 
 def hide_mode_interactive():
@@ -2164,11 +2178,6 @@ def unhide_mode_interactive():
         return
     default_out = str(BASE / "vault.recovered.enc")
     out = input(f"还原到 [回车={Path(default_out).name}]: ").strip().strip('"') or default_out
-    if Path(out).exists():
-        ans = input(_c(f"⚠️  {Path(out).name} 已存在，覆盖？(yes/no): ", _YELLOW)).strip().lower()
-        if ans not in ("y", "yes"):
-            print("已取消")
-            return
     try:
         plen = extract_from_image(stego, out)
     except Exception as e:

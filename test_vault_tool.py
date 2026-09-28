@@ -537,6 +537,27 @@ class TestSteganography(unittest.TestCase):
         with self.assertRaises(ValueError):
             vault_tool.extract_from_image(cover, self.tmpdir / "x")
 
+    def test_cli_hide_and_unhide_keep_existing_outputs_byte_for_byte(self):
+        cover = self.tmpdir / "cover.jpg"
+        cover.write_bytes(b"\xff\xd8\xfffixture\xff\xd9")
+        payload = self.tmpdir / "payload.enc"
+        payload.write_bytes(b"fictional ciphertext")
+        stego = self.tmpdir / "stego.jpg"
+        vault_tool.hide_in_image(cover, payload, stego)
+        old_image = b"existing image must survive"
+        old_vault = b"newer fictional vault must survive"
+        hidden_output = self.tmpdir / "existing.jpg"
+        recovered_output = self.tmpdir / "existing.enc"
+        hidden_output.write_bytes(old_image)
+        recovered_output.write_bytes(old_vault)
+        with mock.patch.object(vault_tool, "VAULT_FILE", payload), contextlib.redirect_stdout(io.StringIO()):
+            hide_exit = vault_tool.main(["hide", "--cover", str(cover), "--out", str(hidden_output)])
+            unhide_exit = vault_tool.main(["unhide", "--in", str(stego), "--out", str(recovered_output)])
+        self.assertEqual(hide_exit, 1)
+        self.assertEqual(unhide_exit, 1)
+        self.assertEqual(hidden_output.read_bytes(), old_image)
+        self.assertEqual(recovered_output.read_bytes(), old_vault)
+
 
 class TestVaultVersionV3(unittest.TestCase):
     """V3 版本与标志位检测。"""
