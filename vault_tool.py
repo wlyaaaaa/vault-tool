@@ -1774,15 +1774,6 @@ def decrypt_mode(force_no_disk=False, force_extract=False, keyfile_path=None):
     return True
 
 
-def _iter_text_members(tar):
-    """生成 tar 中的 (member, 是否可作文本显示)。"""
-    for m in sorted(tar.getmembers(), key=lambda x: x.name):
-        if not m.isfile():
-            continue
-        ext = Path(m.name).suffix.lower()
-        yield m, (ext in TEXT_EXT and m.size <= TEXT_PRINT_LIMIT)
-
-
 def _print_member_text(tar, m):
     """打印单个文本成员的内容。"""
     data = tar.extractfile(m).read()
