@@ -335,6 +335,26 @@ try {
     $updateRun = Invoke-PublishCase -CaseRoot $updateCase -Config @{}
     Assert-SuccessResult -Run $updateRun -CaseName 'successful byte readback' -Created:$false
 
+    $currentCase = Join-Path $runRoot 'already-current'
+    New-Item -ItemType Directory -Path $currentCase -Force | Out-Null
+    $currentSha = [Convert]::ToHexString([Security.Cryptography.SHA1]::HashData([byte[]]([Text.Encoding]::ASCII.GetBytes("blob 7`0") + @(0x10, 0x22, 0x30, 0x44, 0x55, 0x66, 0x70)))).ToLowerInvariant()
+    $currentRun = Invoke-PublishCase -CaseRoot $currentCase -Config @{ existing_sha = $currentSha; readback_sha = $currentSha }
+    Assert-Equal -Expected 0 -Actual $currentRun.ExitCode -Message 'already-current must succeed'
+    $currentResult = Get-ChildJsonResult -Output $currentRun.Output
+    Assert-True -Condition ([bool]$currentResult.already_current -and -not [bool]$currentResult.upload_performed) -Message 'already-current must skip upload'
+    Assert-True -Condition ([bool]$currentResult.readback_verified) -Message 'already-current must verify readback'
+    Assert-Equal -Expected $null -Actual $currentResult.commit_sha -Message 'already-current must not claim a new commit'
+    Assert-Equal -Expected 0 -Actual $currentRun.State.put_count -Message 'already-current PUT count'
+    Assert-Equal -Expected 2 -Actual $currentRun.State.contents_get_count -Message 'already-current contents read count'
+    Assert-Equal -Expected 1 -Actual $currentRun.State.blob_get_count -Message 'already-current blob read count'
+    $currentWrongCase = Join-Path $runRoot 'already-current-wrong-bytes'
+    New-Item -ItemType Directory -Path $currentWrongCase -Force | Out-Null
+    $currentWrongRun = Invoke-PublishCase -CaseRoot $currentWrongCase -Config @{ existing_sha = $currentSha; readback_sha = $currentSha; blob_content = 'mYh3' }
+    Assert-True -Condition ($currentWrongRun.ExitCode -ne 0) -Message 'already-current wrong bytes must fail'
+    Assert-Equal -Expected 0 -Actual $currentWrongRun.State.put_count -Message 'already-current wrong bytes must not PUT'
+    Assert-Equal -Expected 1 -Actual $currentWrongRun.State.blob_get_count -Message 'already-current wrong bytes must be read'
+    Assert-True -Condition ($null -eq (Get-ChildJsonResult -Output $currentWrongRun.Output)) -Message 'already-current wrong bytes must not report success'
+
     $putFailureCase = Join-Path $runRoot 'put-failure'
     New-Item -ItemType Directory -Path $putFailureCase -Force | Out-Null
     $putFailureRun = Invoke-PublishCase -CaseRoot $putFailureCase -Config @{ put_status = 500 }

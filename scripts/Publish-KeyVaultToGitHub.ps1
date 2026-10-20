@@ -170,6 +170,17 @@ elseif (-not (Test-GhNotFoundResponse -Response $existingResponse)) {
 
 $uploadBytes = [IO.File]::ReadAllBytes($item.FullName)
 $uploadSha256 = Get-Sha256Hex -Bytes $uploadBytes
+$blobHasher = [Security.Cryptography.SHA1]::Create()
+try {
+    $blobHeader = [Text.Encoding]::ASCII.GetBytes("blob $($uploadBytes.Length)`0")
+    [void]$blobHasher.TransformBlock($blobHeader, 0, $blobHeader.Length, $null, 0)
+    [void]$blobHasher.TransformFinalBlock($uploadBytes, 0, $uploadBytes.Length)
+    $uploadBlobSha = [BitConverter]::ToString($blobHasher.Hash).Replace('-', '').ToLowerInvariant()
+}
+finally {
+    $blobHasher.Dispose()
+}
+$alreadyCurrent = $existingSha -ceq $uploadBlobSha
 
 if (-not $PSCmdlet.ShouldProcess("$Repo/$RemotePath", "upload encrypted vault artifact")) {
     Write-PublishResult -Result ([ordered]@{
@@ -197,12 +208,16 @@ if ($existingSha) {
     $body.sha = $existingSha
 }
 
-$tmpPath = [IO.Path]::GetTempFileName()
+$tmpPath = $null
 try {
-    $body | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $tmpPath -Encoding UTF8
-    $putResponse = Invoke-GhApiText -Endpoint $contentsEndpoint -Method PUT -InputFile $tmpPath
+    $putResponse = $null
+    if (-not $alreadyCurrent) {
+        $tmpPath = [IO.Path]::GetTempFileName()
+        $body | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $tmpPath -Encoding UTF8
+        $putResponse = Invoke-GhApiText -Endpoint $contentsEndpoint -Method PUT -InputFile $tmpPath
+    }
     $commitSha = $null
-    if (-not [string]::IsNullOrWhiteSpace($putResponse.Text)) {
+    if ($null -ne $putResponse -and -not [string]::IsNullOrWhiteSpace($putResponse.Text)) {
         try {
             $putJson = $putResponse.Text | ConvertFrom-Json
             if ($putJson.PSObject.Properties.Name -contains 'commit' -and $null -ne $putJson.commit) {
@@ -265,7 +280,8 @@ try {
             bytes              = [Int64]$uploadBytes.Length
             sha256             = $uploadSha256
             readback_verified  = $true
-            upload_performed   = $true
+            upload_performed   = -not $alreadyCurrent
+            already_current    = $alreadyCurrent
             what_if            = $false
         })
 }

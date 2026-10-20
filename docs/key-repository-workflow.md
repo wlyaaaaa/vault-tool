@@ -21,9 +21,9 @@
    ```
 
 7. 明确执行时去掉 `-WhatIf`。脚本不会克隆 `wlyaaaaa/Key`，拒绝非私有目标；只把真实 404 当成新文件，其他前置错误和 PUT 失败都停止。
-8. 发布后脚本从默认分支读取实际目标的 Git blob（文件内容对象），比较远端字节长度及 SHA-256。只有实际上传与字节回读都成立才报告成功。
+8. 脚本先比较本地 Git blob SHA 与远端 SHA；相同就跳过上传，避免产生空提交。随后从默认分支读取实际目标的 Git blob（文件内容对象），比较远端字节长度及 SHA-256；无论是否上传，只有字节回读一致才报告成功。
 
-成功 JSON 中的 `upload_performed`、`readback_verified` 均为 `true`，并提供 `repo/path/branch/commit_sha/blob_sha/bytes/sha256`。预演时两字段为 `false`。真实写入后回读失败，远端可能已经变化：先核对现状，不要盲目重复上传。
+实际上传成功时，JSON 中 `upload_performed=true`、`already_current=false`、`readback_verified=true`；密文未变时为 `upload_performed=false`、`already_current=true`、`readback_verified=true`，`commit_sha=null`。两种结果都提供 `repo/path/branch/commit_sha/blob_sha/bytes/sha256`。预演时 `upload_performed`、`readback_verified` 均为 `false`。真实写入后回读失败，远端可能已经变化：先核对现状，不要盲目重复上传。
 
 扩展名只表示允许处理的输入类别，不能证明文件确已加密。远端字节一致也只证明保存了同一份密文；它不验证密码、密钥文件或恢复机器环境，不能替代第 5 步。
 
