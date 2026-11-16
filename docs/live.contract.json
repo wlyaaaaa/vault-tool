@@ -4,17 +4,18 @@
   "headline": null, "tasks": [], "skills": ["vault-workflow"], "bindings_complete": true,
   "metrics": [
     {"id":"docs_files","label":"自有文档文件","source":"vault.static","pointer":"/metrics/docs_files","time":"/at","mode":"static","unit":"个","public":"same"},
-    {"id":"docs_words","label":"文档按汉字和英文数字串计字（B）","source":"vault.static","pointer":"/metrics/docs_words","time":"/at","mode":"static","unit":"字","public":"same"},
+    {"id":"docs_words","label":"文档字数（汉字和英文数字串）","source":"vault.static","pointer":"/metrics/docs_words","time":"/at","mode":"static","unit":"字","public":"same"},
     {"id":"code_files","label":"自有代码文件（含测试）","source":"vault.static","pointer":"/metrics/code_files","time":"/at","mode":"static","unit":"个","public":"same"},
-    {"id":"code_chars","label":"代码非空白字符（A，含测试）","source":"vault.static","pointer":"/metrics/code_chars","time":"/at","mode":"static","unit":"字","public":"same"},
-    {"id":"code_words","label":"代码按汉字和英文数字串计字（B，含测试）","source":"vault.static","pointer":"/metrics/code_words","time":"/at","mode":"static","unit":"字","public":"same"},
+    {"id":"code_chars","label":"代码非空白字符（含测试）","source":"vault.static","pointer":"/metrics/code_chars","time":"/at","mode":"static","unit":"字符","public":"same"},
+    {"id":"code_words","label":"代码字数（汉字和英文数字串，含测试）","source":"vault.static","pointer":"/metrics/code_words","time":"/at","mode":"static","unit":"字","public":"same"},
     {"id":"tracked_files","label":"Git 已跟踪文件","source":"vault.static","pointer":"/metrics/tracked_files","time":"/at","mode":"static","unit":"个","public":"same"},
     {"id":"test_definitions","label":"测试定义（不代表本次通过）","source":"vault.static","pointer":"/metrics/test_definitions","time":"/at","mode":"static","unit":"个","public":"same"},
     {"id":"windows_required_packages","label":"Windows 默认加密路径必需的第三方包","source":"vault.static","pointer":"/metrics/windows_required_packages","time":"/at","mode":"static","unit":"个","public":"same"},
     {"id":"slot_capacity","label":"VAULT03 设计可独立解锁的槽位","source":"vault.static","pointer":"/metrics/slot_capacity","time":"/at","mode":"static","unit":"个","public":"same"}
   ],
   "sections": [
-    {"id":"more-data","label":"更多数据","about":"好奇：自有文件、测试和设计容量有多少？","metrics":["docs_files","docs_words","code_files","code_chars","code_words","tracked_files","test_definitions","windows_required_packages","slot_capacity"],"note":"按需更新，静态值保留取数时刻；代码含注释、空行和测试。A 排除空白，B 按每个汉字和每串英文数字计字。两个槽位是设计容量，不说明私人保险箱实际用了几层；可选 Argon2 不计入默认依赖。"}
+    {"id":"more-data","label":"更多数据","about":"好奇：自有文件、测试和设计容量有多少？","metrics":["docs_files","docs_words","code_files","code_chars","code_words","tracked_files","test_definitions"],"note":"按需更新，静态值保留取数时刻；代码含注释、空行和测试。非空白字符逐个计数；另一口径把每个汉字和每串英文数字各计一字。两个槽位是设计容量，不说明私人保险箱实际用了几层；可选 Argon2 不计入默认依赖。"},
+    {"id": "capabilities","label": "能做什么","about": "两套独立解锁槽位，以及默认加密路径需要多少第三方包。","metrics": ["slot_capacity","windows_required_packages"],"note": "设计能力，不表示私人保险箱用了几层；默认依赖不含可选 Argon2。"}
   ],
   "artifacts": {"source":"vault.static","pointer":"/artifacts"},
   "size": {"source":"vault.static","pointer":"/size"},

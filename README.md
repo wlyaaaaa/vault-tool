@@ -11,5 +11,5 @@
 实况接入单在 [docs/live.contract.json](docs/live.contract.json)。源码规模和更多数据按需更新：
 `python vault_tool.py doctor --json --live-output docs/live.snapshot.json`。
 如需本人份，另加 `--owner-live-output <私有位置的JSON> --vault-file <明确的密文文件>`；仅查外部元数据和旧日志动作前缀，不读容器。
-本人份放私有配套库，不能写进公开源码目录。没有自动刷新任务；源文件未变时静态快照保留原取数时刻。
+本人份放本机登记的私有运行目录，不能写进公开源码目录。本机沿既有每晚自检刷新外部元数据；源文件未变时静态快照保留原取数时刻。
 相关验证：`python -m unittest discover -v`；`pwsh -NoProfile -File scripts/Test-Publish-KeyVaultToGitHub.ps1`（均使用虚构数据）。
