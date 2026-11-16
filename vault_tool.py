@@ -45,9 +45,12 @@ import threading
 import subprocess
 import gc
 import json
+import ast
+import re
+from collections import Counter
 from pathlib import Path
 from getpass import getpass
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 def _configure_stdio():
@@ -1372,6 +1375,72 @@ def collect_doctor_info(base=None, vault_file=None):
     }
 
 
+def write_live_snapshots(output, owner_output=None, vault_file=None, base=None):
+    """On-demand public source counts; optional private stat/log-prefix summary, never vault bytes."""
+    if owner_output and not vault_file:
+        raise ValueError("owner live output requires an explicit --vault-file")
+    root = Path(base) if base else BASE
+    if owner_output and (Path(owner_output).resolve().is_relative_to(root.resolve()) or Path(owner_output).resolve() == Path(output).resolve()):
+        raise ValueError("owner live output must stay outside the public source tree and public output")
+    if any(Path(p).suffix.lower() != ".json" for p in (output, owner_output) if p):
+        raise ValueError("live outputs must be JSON files")
+    if vault_file and Path(vault_file).resolve() in {Path(p).resolve() for p in (output, owner_output) if p}:
+        raise ValueError("live output must not replace its vault input")
+    now = datetime.now(timezone.utc).isoformat()
+    names = subprocess.check_output(["git", "-C", str(root), "ls-files", "-z"]).decode("utf-8").split("\0")[:-1]
+    groups = {"docs": [], "code": []}
+    tests = 0
+    for name in names:
+        suffix = Path(name).suffix.lower()
+        if suffix not in {".md", ".py", ".ps1"}:
+            continue
+        text = (root / name).read_text(encoding="utf-8-sig")
+        groups["docs" if suffix == ".md" else "code"].append(text)
+        if suffix == ".py":
+            tests += sum(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test_") for n in ast.walk(ast.parse(text)))
+    metrics = {"tracked_files": len(names), "test_definitions": tests,
+               "windows_required_packages": 0, "slot_capacity": 2}
+    for group, texts in groups.items():
+        metrics[group + "_files"] = len(texts)
+        metrics[group + "_chars"] = sum(len(re.sub(r"\s", "", t)) for t in texts)
+        metrics[group + "_words"] = sum(len(re.findall(r"[\u4e00-\u9fff]|[A-Za-z0-9_]+", t)) for t in texts)
+    data = dict(v=1, inputs_sha256=hashlib.sha256("\0".join(names + groups["docs"] + groups["code"]).encode("utf-8")).hexdigest(), scope="Git 跟踪的自有 Markdown、Python、PowerShell，含测试；按需更新；字数 A 排除空白，B 按汉字和英文数字串计。设计参数不是使用记录。",
+                metrics=metrics, size=dict(docs_chars=metrics.pop("docs_chars"), code_lines=sum(len(t.splitlines()) for t in groups["code"])), artifacts=[])
+    target = Path(output)
+    previous = json.loads(target.read_text(encoding="utf-8")) if target.exists() else {}
+    old_at = previous.pop("at", None)
+    previous.get("size", {}).pop("at", None)
+    at = old_at if previous == data and old_at else now
+    data["at"] = data["size"]["at"] = at
+    target.parent.mkdir(parents=True, exist_ok=True)
+    serialized = "{\n" + ",\n".join("  " + json.dumps(k) + ": " + json.dumps(v, ensure_ascii=False) for k, v in data.items()) + "\n}\n"
+    if not target.exists() or target.read_text(encoding="utf-8") != serialized:
+        target.write_text(serialized, encoding="utf-8")
+    if owner_output:
+        private = dict(v=1, at=now, scope="明确密文文件的外部元数据与旧日志动作前缀；不读容器；按需采样，尚未自动刷新。", metrics={})
+        values = private["metrics"]
+        try:
+            meta = Path(vault_file).stat()
+            if not stat.S_ISREG(meta.st_mode):
+                raise ValueError("not_regular_file")
+            values.update(local_file=dict(text=f"在，{meta.st_size / 1024:g} KB", exists=True, bytes=meta.st_size),
+                          modified=datetime.fromtimestamp(meta.st_mtime, timezone.utc).isoformat())
+        except FileNotFoundError:
+            values.update(local_file=dict(text="不在", exists=False, bytes=None), modified=None)
+        except (OSError, ValueError):
+            values.update(local_file=None, modified=None, file_note="文件元数据不可读或不是普通文件")
+        try:
+            log = Path(vault_file).parent / "vault.log"
+            actions = Counter(m.decode("ascii") for m in re.findall(rb"(?m)^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d \| ([A-Z_]+):", log.read_bytes()) if m in {b"INFO", b"MIGRATE", b"ENCRYPT", b"DECRYPT", b"UPDATE", b"PASSWD", b"STEG_HIDE", b"STEG_EXTRACT"})
+            values.update(legacy_ops=sum(actions.values()), legacy_rows=[dict(text=k, count=v, state_text="旧日志已记载") for k, v in sorted(actions.items())],
+                          log_modified=datetime.fromtimestamp(log.stat().st_mtime, timezone.utc).isoformat())
+        except OSError:
+            values.update(legacy_ops=None, legacy_rows=None, log_modified=None, log_note="旧日志缺失或不可读")
+        target = Path(owner_output)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(private, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
 def _ai_safe_contract(mode):
     return {
         "ok": True,
@@ -2594,6 +2663,8 @@ def _parse_args(argv=None):
 
     doctor = sub.add_parser("doctor", help="检查本地 vault-tool 环境")
     doctor.add_argument("--json", action="store_true", help="输出 AI-safe JSON 元数据")
+    doctor.add_argument("--live-output", help="按需更新公开实况快照（只统计自有源码）")
+    doctor.add_argument("--owner-live-output", help="另存本人元数据快照；须明确 --vault-file，输出保存在私有位置")
 
     assess = sub.add_parser("assess", help="AI-safe 风险评估（不解密）")
     assess.add_argument("--json", action="store_true", help="输出 AI-safe JSON 元数据")
@@ -2719,6 +2790,10 @@ def main(argv=None):
             elif vault_info() is False:
                 return 1
         elif args.command == "doctor":
+            if args.owner_live_output and not args.live_output:
+                raise ValueError("--owner-live-output requires --live-output")
+            if args.live_output:
+                write_live_snapshots(args.live_output, args.owner_live_output, args.vault_file)
             data = collect_doctor_info(vault_file=args.vault_file)
             if args.json:
                 _print_json(data)

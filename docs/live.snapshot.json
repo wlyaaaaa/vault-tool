@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "inputs_sha256": "9cb431ab27d23dbfc2ac299ae08358b75827276d8e67c5c21935ee8a57219814",
+  "scope": "Git 跟踪的自有 Markdown、Python、PowerShell，含测试；按需更新；字数 A 排除空白，B 按汉字和英文数字串计。设计参数不是使用记录。",
+  "metrics": {"tracked_files": 15, "test_definitions": 146, "windows_required_packages": 0, "slot_capacity": 2, "docs_files": 3, "docs_words": 1735, "code_files": 9, "code_chars": 197866, "code_words": 31891},
+  "size": {"docs_chars": 4788, "code_lines": 6326, "at": "2026-11-16T01:33:47.223158+00:00"},
+  "artifacts": [],
+  "at": "2026-11-16T01:33:47.223158+00:00"
+}

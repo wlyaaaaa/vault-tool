@@ -1,0 +1,23 @@
+{
+  "v": 1, "id": "vault-tool", "name": "加密保险箱",
+  "about": "把选定文件锁进一个加密文件，要用时在本机打开。",
+  "headline": null, "tasks": [], "skills": ["vault-workflow"], "bindings_complete": true,
+  "metrics": [
+    {"id":"docs_files","label":"自有文档文件","source":"vault.static","pointer":"/metrics/docs_files","time":"/at","mode":"static","unit":"个","public":"same"},
+    {"id":"docs_words","label":"文档按汉字和英文数字串计字（B）","source":"vault.static","pointer":"/metrics/docs_words","time":"/at","mode":"static","unit":"字","public":"same"},
+    {"id":"code_files","label":"自有代码文件（含测试）","source":"vault.static","pointer":"/metrics/code_files","time":"/at","mode":"static","unit":"个","public":"same"},
+    {"id":"code_chars","label":"代码非空白字符（A，含测试）","source":"vault.static","pointer":"/metrics/code_chars","time":"/at","mode":"static","unit":"字","public":"same"},
+    {"id":"code_words","label":"代码按汉字和英文数字串计字（B，含测试）","source":"vault.static","pointer":"/metrics/code_words","time":"/at","mode":"static","unit":"字","public":"same"},
+    {"id":"tracked_files","label":"Git 已跟踪文件","source":"vault.static","pointer":"/metrics/tracked_files","time":"/at","mode":"static","unit":"个","public":"same"},
+    {"id":"test_definitions","label":"测试定义（不代表本次通过）","source":"vault.static","pointer":"/metrics/test_definitions","time":"/at","mode":"static","unit":"个","public":"same"},
+    {"id":"windows_required_packages","label":"Windows 默认加密路径必需的第三方包","source":"vault.static","pointer":"/metrics/windows_required_packages","time":"/at","mode":"static","unit":"个","public":"same"},
+    {"id":"slot_capacity","label":"VAULT03 设计可独立解锁的槽位","source":"vault.static","pointer":"/metrics/slot_capacity","time":"/at","mode":"static","unit":"个","public":"same"}
+  ],
+  "sections": [
+    {"id":"more-data","label":"更多数据","about":"好奇：自有文件、测试和设计容量有多少？","metrics":["docs_files","docs_words","code_files","code_chars","code_words","tracked_files","test_definitions","windows_required_packages","slot_capacity"],"note":"按需更新，静态值保留取数时刻；代码含注释、空行和测试。A 排除空白，B 按每个汉字和每串英文数字计字。两个槽位是设计容量，不说明私人保险箱实际用了几层；可选 Argon2 不计入默认依赖。"}
+  ],
+  "artifacts": {"source":"vault.static","pointer":"/artifacts"},
+  "size": {"source":"vault.static","pointer":"/size"},
+  "links": [{"id":"intro","label":"项目介绍","href":"https://github.com/wlyaaaaa/vault-tool#readme"}],
+  "skills_href": "/skills/?project=vault-tool"
+}

@@ -7,3 +7,9 @@
 - **让 AI 做什么：** 检查加密文件的信息和操作步骤。密码只在本机自己输入，不发给 AI。
 
 私人 Key 仓库的密文备份和回读步骤见 [Key 仓库工作流](docs/key-repository-workflow.md)。密码或必需的密钥文件丢了，就无法找回。
+
+实况接入单在 [docs/live.contract.json](docs/live.contract.json)。源码规模和更多数据按需更新：
+`python vault_tool.py doctor --json --live-output docs/live.snapshot.json`。
+如需本人份，另加 `--owner-live-output <私有位置的JSON> --vault-file <明确的密文文件>`；仅查外部元数据和旧日志动作前缀，不读容器。
+本人份放私有配套库，不能写进公开源码目录。没有自动刷新任务；源文件未变时静态快照保留原取数时刻。
+相关验证：`python -m unittest discover -v`；`pwsh -NoProfile -File scripts/Test-Publish-KeyVaultToGitHub.ps1`（均使用虚构数据）。
